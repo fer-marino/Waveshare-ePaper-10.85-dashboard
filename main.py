@@ -18,6 +18,8 @@ import subprocess
 import math
 import calendar
 import urllib.parse
+import re
+import importlib.util
 from collections import deque
 from datetime import datetime, timezone
 from PIL import Image, ImageDraw, ImageFont, ImageOps, ImageEnhance
@@ -40,16 +42,58 @@ BASE_DIR = os.path.dirname(os.path.realpath(__file__))
 LIB_DIR = os.path.join(BASE_DIR, 'lib')
 FONT_DIR = os.path.join(BASE_DIR, 'fnt')
 ICON_DIR = os.path.join(BASE_DIR, 'icons')
-LOG_FILE = os.path.join(BASE_DIR, 'dashboard.log')
 
-# --- WIDGET TOGGLES ---
-ENABLE_STRAVA = False # For payed tier only
-ENABLE_BAMBU = False
-ENABLE_ROBOROCK = False
-ENABLE_ANTIGRAVITY = False
-ENABLE_CODEX = False
-ENABLE_CLAUDE = False
-ENABLE_SPOTIFY = False
+# --- CONFIG LOADING ---
+# Settings live outside the code so a package can ship without anyone's
+# credentials in it, and so upgrading never overwrites local values. First
+# match wins; everything below falls back to the defaults defined here.
+CONFIG_PATHS = [
+    os.environ.get('EPAPER_CONFIG', ''),
+    '/etc/epaper-dashboard/config.py',
+    os.path.join(BASE_DIR, 'config.py'),
+]
+
+_cfg = {}
+CONFIG_FILE = None
+for _path in CONFIG_PATHS:
+    if _path and os.path.exists(_path):
+        try:
+            _spec = importlib.util.spec_from_file_location('epaper_config', _path)
+            _mod = importlib.util.module_from_spec(_spec)
+            _spec.loader.exec_module(_mod)
+            _cfg = {k: v for k, v in vars(_mod).items() if not k.startswith('_')}
+            CONFIG_FILE = _path
+        except Exception as _e:
+            print(f"Failed to load config {_path}: {_e}")
+        break
+
+
+def conf(name, default):
+    return _cfg.get(name, default)
+
+
+# Writable state (tokens, logs). Kept apart from the code so the package
+# directory can stay read-only.
+STATE_DIR = conf('STATE_DIR', BASE_DIR)
+try:
+    os.makedirs(STATE_DIR, exist_ok=True)
+except OSError:
+    STATE_DIR = BASE_DIR
+
+LOG_FILE = os.path.join(STATE_DIR, 'dashboard.log')
+
+# --- WIDGET TOGGLES --- (override any of these in the config file)
+ENABLE_STRAVA = conf('ENABLE_STRAVA', False)  # paid tier only
+ENABLE_BAMBU = conf('ENABLE_BAMBU', False)
+ENABLE_ROBOROCK = conf('ENABLE_ROBOROCK', False)
+ENABLE_ANTIGRAVITY = conf('ENABLE_ANTIGRAVITY', False)
+ENABLE_CODEX = conf('ENABLE_CODEX', False)
+ENABLE_CLAUDE = conf('ENABLE_CLAUDE', False)
+ENABLE_SPOTIFY = conf('ENABLE_SPOTIFY', False)
+# Replaces the Gmail slot with DSL line stats read straight off the router.
+ENABLE_FRITZBOX = conf('ENABLE_FRITZBOX', True)
+# Top-left slot: a phrase a day in the local language.
+ENABLE_PHRASE = conf('ENABLE_PHRASE', True)
 
 # --- API ENDPOINTS ---
 API_ENDPOINTS = {
@@ -64,32 +108,23 @@ API_ENDPOINTS = {
 }
 
 # --- CONFIGURATION ---
-LOCATION_LAT = 44.8140857
-LOCATION_LON = 20.3934271
+LOCATION_LAT = conf('LOCATION_LAT', 50.1109)
+LOCATION_LON = conf('LOCATION_LON', 8.6821)
 
-PRINTER_CONF = {
-    'IP': '192.168....',
-    'SERIAL': '....',
-    'ACCESS_CODE': '....'
-}
+PRINTER_CONF = conf('PRINTER_CONF', {'IP': '', 'SERIAL': '', 'ACCESS_CODE': ''})
 
-ROBOROCK_CONF = {
-    'EMAIL': 'your@email.com'
-}
+ROBOROCK_CONF = conf('ROBOROCK_CONF', {'EMAIL': ''})
 
-LASTFM_CONF = {
-    'API_KEY': '...',
-    'USERNAME': 'your_name'
-}
+FRITZBOX_CONF = conf('FRITZBOX_CONF', {'HOST': 'fritz.box'})
 
-STRAVA_CONF = {
-    'TOKEN_FILE': os.path.join(BASE_DIR, 'strava_token.json')
-}
+LASTFM_CONF = conf('LASTFM_CONF', {'API_KEY': '', 'USERNAME': ''})
+
+STRAVA_CONF = {'TOKEN_FILE': os.path.join(STATE_DIR, 'strava_token.json')}
 
 # --- FILES & SCOPES ---
-GMAIL_TOKEN_PATH = os.path.join(BASE_DIR, 'token.json')
-ROBOROCK_TOKEN_FILE = os.path.join(BASE_DIR, 'roborock_session.pkl')
-ROBOROCK_STATS_FILE = os.path.join(BASE_DIR, 'roborock_stats.json')
+GMAIL_TOKEN_PATH = os.path.join(STATE_DIR, 'token.json')
+ROBOROCK_TOKEN_FILE = os.path.join(STATE_DIR, 'roborock_session.pkl')
+ROBOROCK_STATS_FILE = os.path.join(STATE_DIR, 'roborock_stats.json')
 GMAIL_SCOPES = ['https://www.googleapis.com/auth/gmail.readonly']
 
 if os.path.exists(LIB_DIR):
@@ -157,6 +192,22 @@ if EPD_DEBUG:
 # extra re-init there to avoid needless latency and ghosting. Detected by core
 # count: Zero 1 = 1 core, everything newer = 4+.
 PANEL_REINIT_EACH_FRAME = (os.cpu_count() or 1) < 2
+
+# --- REFRESH CADENCE ---
+# This is the 4-color (G) panel, which has no partial-refresh mode: every update
+# is a full refresh taking ~18s and visibly flashing the whole screen. Waveshare
+# warns that refreshing large e-paper too often causes ghosting and can damage
+# the panel, so we update far less frequently than the B/W build's 60s loop.
+REFRESH_INTERVAL_SEC = conf('REFRESH_INTERVAL_SEC', 300)
+
+# --- PANEL PALETTE ---
+# The (G) panel renders exactly four colors. getbuffer() quantizes with
+# Floyd-Steinberg dithering, so anything NOT one of these four gets dithered into
+# speckle - which looks terrible on text. Always draw with these exact values.
+BLACK = (0, 0, 0)
+WHITE = (255, 255, 255)
+YELLOW = (255, 255, 0)
+RED = (255, 0, 0)
 
 icon_cache = {}
 global_printer = None
@@ -242,12 +293,17 @@ class DataStore:
         }
         self.sysload = {'cpu': 0, 'ram_free': 0, 'history': deque(maxlen=30)}
         self.crypto = {'btc': 0, 'eth': 0, 'btc_hist': [], 'eth_hist': []}
+        # Top 24h movers from Coinbase: [(symbol, pct_change), ...]
+        self.movers = {'gainers': [], 'losers': []}
         self.ping = {'current': 0, 'history': deque(maxlen=50)}
+        self.fritz = {'ok': False, 'down_max': 0, 'up_max': 0,
+                      'down_now': 0, 'up_now': 0, 'uptime': 0}
 
         self.last_update = {
             'weather': 0, 'strava': 0, 'printer': 0, 'gmail': 0,
             'spotify': 0, 'crypto': 0, 'sysload': 0, 'ping': 0,
-            'claude': 0, 'antigravity': 0, 'codex': 0
+            'claude': 0, 'antigravity': 0, 'codex': 0,
+            'movers': 0, 'fritz': 0
         }
 
 
@@ -255,6 +311,197 @@ data_store = DataStore()
 
 
 # --- HELPERS ---
+def fetch_fritzbox():
+    """DSL sync rate and live throughput from the router over TR-064/IGD.
+
+    This is the real line capacity - a speedtest from the Pi only ever measures
+    its own 2.4GHz wifi (~20 Mbps), which is far below what the line actually
+    syncs at. The IGD endpoints used here need no authentication.
+    """
+    host = FRITZBOX_CONF.get('HOST', 'fritz.box')
+    IFC = 'urn:schemas-upnp-org:service:WANCommonInterfaceConfig:1'
+    CONN = 'urn:schemas-upnp-org:service:WANIPConnection:1'
+    envelope = ('<?xml version="1.0"?>'
+                '<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" '
+                's:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">'
+                '<s:Body><u:{a} xmlns:u="{n}"/></s:Body></s:Envelope>')
+
+    def call(path, ns, action):
+        r = requests.post(
+            f'http://{host}:49000{path}',
+            data=envelope.format(a=action, n=ns),
+            headers={'Content-Type': 'text/xml; charset="utf-8"',
+                     'SoapAction': f'{ns}#{action}'},
+            timeout=6)
+        r.raise_for_status()
+        return dict(re.findall(r'<(New[A-Za-z0-9]+)>([^<]*)</\1>', r.text))
+
+    try:
+        link = call('/igdupnp/control/WANCommonIFC1', IFC, 'GetCommonLinkProperties')
+        addon = call('/igdupnp/control/WANCommonIFC1', IFC, 'GetAddonInfos')
+        # Uptime lives on WANIPConnection, not on the interface-config service.
+        status = call('/igdupnp/control/WANIPConn1', CONN, 'GetStatusInfo')
+    except Exception:
+        return None
+
+    def num(d, k):
+        try:
+            return int(d.get(k, 0) or 0)
+        except ValueError:
+            return 0
+
+    if link.get('NewPhysicalLinkStatus') != 'Up':
+        return {'ok': False, 'down_max': 0, 'up_max': 0,
+                'down_now': 0, 'up_now': 0, 'uptime': 0}
+
+    return {
+        'ok': True,
+        'down_max': num(link, 'NewLayer1DownstreamMaxBitRate'),
+        'up_max': num(link, 'NewLayer1UpstreamMaxBitRate'),
+        'down_now': num(addon, 'NewByteReceiveRate') * 8,
+        'up_now': num(addon, 'NewByteSendRate') * 8,
+        'uptime': num(status, 'NewUptime'),
+    }
+
+
+def fetch_coinbase_movers(min_notional=2_000_000, count=4):
+    """Top 24h gainers/losers across Coinbase USD pairs.
+
+    One bulk request covers every product. Pairs are filtered by 24h notional
+    volume first - without that the list is dominated by illiquid tokens whose
+    triple-digit swings mean nothing.
+    """
+    data = net.get_json('https://api.exchange.coinbase.com/products/stats')
+    if not data:
+        return None
+    rows = []
+    for pid, st in data.items():
+        if not pid.endswith('-USD'):
+            continue
+        day = (st or {}).get('stats_24hour') or {}
+        try:
+            op = float(day['open'])
+            last = float(day['last'])
+            vol = float(day.get('volume', 0) or 0)
+        except (KeyError, TypeError, ValueError):
+            continue
+        if op <= 0 or last <= 0 or vol * last < min_notional:
+            continue
+        rows.append((pid[:-4], (last - op) / op * 100.0))
+    if not rows:
+        return None
+    rows.sort(key=lambda r: r[1], reverse=True)
+    return {'gainers': rows[:count], 'losers': rows[-count:][::-1]}
+
+
+# Practical German for everyday life here - admin, shops, doctors, trades,
+# transport. Picked by day-of-year so it is stable across refreshes and turns
+# over once a day; the list is long enough not to repeat for a couple of months.
+GERMAN_PHRASES = [
+    ("Kann ich bitte die Rechnung haben?", "Could I have the bill, please?"),
+    ("Ich haette gerne einen Termin.", "I would like an appointment."),
+    ("Koennen Sie das bitte wiederholen?", "Could you repeat that, please?"),
+    ("Ich verstehe das leider nicht.", "I'm afraid I don't understand."),
+    ("Sprechen Sie bitte langsamer.", "Please speak more slowly."),
+    ("Wo finde ich das Buergeramt?", "Where do I find the citizens' office?"),
+    ("Ich moechte mich anmelden.", "I'd like to register my address."),
+    ("Haben Sie das auch in Groesse M?", "Do you have this in size M?"),
+    ("Kann ich mit Karte zahlen?", "Can I pay by card?"),
+    ("Nur Bargeld, oder?", "Cash only, right?"),
+    ("Wann haben Sie geoeffnet?", "When are you open?"),
+    ("Ist das noch frei?", "Is this seat still free?"),
+    ("Koennen Sie mir helfen?", "Could you help me?"),
+    ("Ich brauche eine Quittung.", "I need a receipt."),
+    ("Wo ist die naechste Haltestelle?", "Where is the nearest stop?"),
+    ("Faehrt dieser Zug nach Frankfurt?", "Does this train go to Frankfurt?"),
+    ("Der Zug hat Verspaetung.", "The train is delayed."),
+    ("Ich habe meinen Anschluss verpasst.", "I missed my connection."),
+    ("Gibt es hier WLAN?", "Is there wifi here?"),
+    ("Wie lange dauert das ungefaehr?", "Roughly how long will that take?"),
+    ("Das ist mir zu teuer.", "That's too expensive for me."),
+    ("Koennen Sie mir einen Rabatt geben?", "Could you give me a discount?"),
+    ("Ich moechte das zurueckgeben.", "I'd like to return this."),
+    ("Haben Sie eine Tuete?", "Do you have a bag?"),
+    ("Ich bin nur am Schauen.", "I'm just looking."),
+    ("Wo ist der Ausgang?", "Where is the exit?"),
+    ("Entschuldigung, wo ist die Toilette?", "Excuse me, where is the toilet?"),
+    ("Ich habe einen Termin um drei.", "I have an appointment at three."),
+    ("Mir geht es nicht gut.", "I'm not feeling well."),
+    ("Ich habe Kopfschmerzen.", "I have a headache."),
+    ("Brauche ich ein Rezept?", "Do I need a prescription?"),
+    ("Ist das rezeptfrei?", "Is that available without prescription?"),
+    ("Wo ist die Notaufnahme?", "Where is the emergency room?"),
+    ("Koennen Sie das bitte aufschreiben?", "Could you write that down?"),
+    ("Ich rufe spaeter zurueck.", "I'll call back later."),
+    ("Koennen Sie mir das erklaeren?", "Could you explain that to me?"),
+    ("Das habe ich nicht bestellt.", "I didn't order this."),
+    ("Die Heizung funktioniert nicht.", "The heating isn't working."),
+    ("Das Wasser laeuft nicht ab.", "The water isn't draining."),
+    ("Wann kommt der Handwerker?", "When is the repairman coming?"),
+    ("Ich habe den Schluessel vergessen.", "I forgot the key."),
+    ("Der Aufzug ist kaputt.", "The lift is broken."),
+    ("Wo kann ich den Muell hinbringen?", "Where can I take the rubbish?"),
+    ("Wann wird der Muell abgeholt?", "When is the rubbish collected?"),
+    ("Das ist Restmuell, oder?", "That's general waste, right?"),
+    ("Ich moechte ein Paket abholen.", "I'd like to collect a parcel."),
+    ("Haben Sie eine Sendungsnummer?", "Do you have a tracking number?"),
+    ("Koennen Sie das bitte unterschreiben?", "Could you sign this, please?"),
+    ("Ich habe eine Frage zur Rechnung.", "I have a question about the bill."),
+    ("Die Abrechnung stimmt nicht.", "The invoice isn't correct."),
+    ("Wann ist die Zahlung faellig?", "When is the payment due?"),
+    ("Ich moechte kuendigen.", "I'd like to cancel my contract."),
+    ("Gibt es eine Kuendigungsfrist?", "Is there a notice period?"),
+    ("Koennen Sie mir das schriftlich geben?", "Can I get that in writing?"),
+    ("Ich warte noch auf eine Antwort.", "I'm still waiting for a reply."),
+    ("Das passt mir gut.", "That works well for me."),
+    ("Passt es Ihnen am Montag?", "Does Monday suit you?"),
+    ("Ich bin gleich da.", "I'll be right there."),
+    ("Tut mir leid, ich bin zu spaet.", "Sorry, I'm running late."),
+    ("Machen Sie sich keine Sorgen.", "Don't worry about it."),
+    ("Vielen Dank fuer Ihre Hilfe.", "Thank you very much for your help."),
+    ("Schoenen Feierabend!", "Have a nice evening after work!"),
+    ("Einen schoenen Tag noch!", "Have a nice day!"),
+    ("Bis naechste Woche.", "See you next week."),
+    ("Wie meinen Sie das?", "How do you mean that?"),
+    ("Das ist kein Problem.", "That's no problem."),
+    ("Koennten Sie kurz warten?", "Could you wait a moment?"),
+    ("Ich melde mich bei Ihnen.", "I'll get in touch with you."),
+    ("Was empfehlen Sie?", "What do you recommend?"),
+    ("Zum Mitnehmen, bitte.", "To take away, please."),
+    ("Stimmt so.", "Keep the change."),
+    ("Getrennt oder zusammen?", "Paying separately or together?"),
+]
+
+
+def phrase_of_the_day():
+    return GERMAN_PHRASES[datetime.now().timetuple().tm_yday % len(GERMAN_PHRASES)]
+
+
+def wrap_text(draw, text, font, max_width, max_lines=2):
+    """Greedy word wrap, ellipsising anything past max_lines."""
+    words = text.split()
+    lines, cur = [], ""
+    for w in words:
+        trial = f"{cur} {w}".strip()
+        if draw.textlength(trial, font=font) <= max_width or not cur:
+            cur = trial
+        else:
+            lines.append(cur)
+            cur = w
+            if len(lines) == max_lines:
+                break
+    if cur and len(lines) < max_lines:
+        lines.append(cur)
+    if len(lines) == max_lines:
+        last = lines[-1]
+        while last and draw.textlength(last + "...", font=font) > max_width:
+            last = last[:-1]
+        consumed = sum(len(l.split()) for l in lines)
+        if consumed < len(words):
+            lines[-1] = last + "..."
+    return lines
+
+
 def ping_printer(ip):
     try:
         result = subprocess.run(
@@ -274,9 +521,14 @@ def get_cached_icon(name, size, is_white=False):
         if os.path.exists(path):
             try:
                 with Image.open(path) as f_img:
-                    img = f_img.convert("L").resize(size)
+                    # LANCZOS keeps 40x40 source art from turning to mush when
+                    # it is scaled up (the weather glyph is drawn at 90x90).
+                    img = f_img.convert("L").resize(size, Image.LANCZOS)
                     img = ImageOps.invert(img)
-                    icon_cache[key] = img.convert("1")
+                    # Hard threshold, NOT convert("1"): that dithers by default,
+                    # which sprays the anti-aliased edges of this grayscale art
+                    # into speckle and makes every icon look dusty on the panel.
+                    icon_cache[key] = img.point(lambda v: 255 if v > 110 else 0, mode="1")
             except:
                 return None
         else:
@@ -665,7 +917,8 @@ def update_data_thread():
                     with data_store.lock:
                         data_store.printer['status'] = 'OFFLINE'
                 data_store.last_update['printer'] = now
-        else:
+        # Crypto has its own slot now, so fetch it regardless of the printer.
+        if True:
             if now - data_store.last_update['crypto'] > 600:
                 btc_url = f"{API_ENDPOINTS['btc']}?vs_currency=usd&days=7"
                 eth_url = f"{API_ENDPOINTS['eth']}?vs_currency=usd&days=7"
@@ -684,7 +937,21 @@ def update_data_thread():
                             data_store.crypto['eth_hist'] = prices[::len(prices) // 50][:50]
                 data_store.last_update['crypto'] = now
 
-        if not ENABLE_ROBOROCK and not ENABLE_ANTIGRAVITY:
+        if ENABLE_FRITZBOX and now - data_store.last_update['fritz'] > 60:
+            fb = fetch_fritzbox()
+            if fb:
+                with data_store.lock:
+                    data_store.fritz = fb
+            data_store.last_update['fritz'] = now
+
+        if now - data_store.last_update['movers'] > 600:
+            mv = fetch_coinbase_movers()
+            if mv:
+                with data_store.lock:
+                    data_store.movers = mv
+            data_store.last_update['movers'] = now
+
+        if True:  # ping drives the top-left widget regardless of other toggles
             if now - data_store.last_update['ping'] > 20:
                 try:
                     out = subprocess.check_output(['ping', '-c', '1', '-W', '1', '8.8.8.8']).decode('utf-8')
@@ -824,15 +1091,16 @@ def update_data_thread():
 
 
 # --- GRAPHICS FUNCTIONS ---
-def draw_icon(draw, x, y, name, size=(40, 40), is_white=False):
+def draw_icon(draw, x, y, name, size=(40, 40), is_white=False, color=None):
     icon = get_cached_icon(name, size, is_white)
+    ink = color if color is not None else (WHITE if is_white else BLACK)
     if icon:
-        draw.bitmap((x, y), icon, fill=255 if is_white else 0)
+        draw.bitmap((x, y), icon, fill=ink)
     else:
-        draw.rectangle((x, y, x + size[0], y + size[1]), outline=255 if is_white else 0)
+        draw.rectangle((x, y, x + size[0], y + size[1]), outline=ink)
 
 
-def draw_sparkline(draw, x, y, data, max_items=50, width=400, height=60, color=0, style="bar"):
+def draw_sparkline(draw, x, y, data, max_items=50, width=400, height=60, color=BLACK, style="bar"):
     if not data: return
     max_val = max(data) if max(data) > 0 else 1
     step = width / max(max_items - 1, 1)
@@ -851,6 +1119,103 @@ def draw_sparkline(draw, x, y, data, max_items=50, width=400, height=60, color=0
             bx = x + i * step
             by = y + height - bh
             draw.rectangle((bx, by, bx + bar_w, y + height), fill=color)
+
+
+def _sun(draw, cx, cy, r, rays=True, unit=4):
+    if rays:
+        for i in range(8):
+            a = math.radians(i * 45)
+            draw.line((cx + math.cos(a) * r * 1.35, cy + math.sin(a) * r * 1.35,
+                       cx + math.cos(a) * r * 1.9, cy + math.sin(a) * r * 1.9),
+                      fill=YELLOW, width=max(2, int(unit)))
+    draw.ellipse((cx - r, cy - r, cx + r, cy + r), fill=YELLOW)
+
+
+def _moon(draw, cx, cy, r):
+    draw.ellipse((cx - r, cy - r, cx + r, cy + r), fill=YELLOW)
+    # bite out of the disc to make a crescent
+    draw.ellipse((cx - r * 1.45, cy - r * 1.15, cx + r * 0.55, cy + r * 0.85), fill=WHITE)
+
+
+def _cloud(draw, cx, cy, w, colour=BLACK):
+    h = w * 0.58
+    draw.ellipse((cx - w * 0.52, cy - h * 0.20, cx - w * 0.02, cy + h * 0.58), fill=colour)
+    draw.ellipse((cx - w * 0.22, cy - h * 0.62, cx + w * 0.34, cy + h * 0.42), fill=colour)
+    draw.ellipse((cx + w * 0.02, cy - h * 0.16, cx + w * 0.52, cy + h * 0.58), fill=colour)
+    draw.rectangle((cx - w * 0.46, cy + h * 0.10, cx + w * 0.46, cy + h * 0.58), fill=colour)
+
+
+def draw_weather_glyph(draw, x, y, size, code, is_day=1):
+    """Draw a weather condition as a real multi-colour glyph.
+
+    The bundled icon BMPs are grayscale line art, so draw_icon() can only stamp
+    them in a single flat colour - a sun behind a cloud comes out entirely
+    yellow or entirely black. These shapes are simple enough to draw directly,
+    which is the only way to get a yellow sun against a black cloud, or a yellow
+    bolt on a storm cloud, out of a 4-colour panel.
+    """
+    s = size
+    unit = max(2, s * 0.055)
+    cx, cy = x + s / 2.0, y + s / 2.0
+
+    if code == 0:                                   # clear
+        (_sun if is_day else _moon)(draw, cx, cy, s * 0.26, *([True, unit] if is_day else []))
+        return
+
+    if code in (1, 2):                              # partly cloudy: sun + cloud
+        _sun(draw, x + s * 0.62, y + s * 0.34, s * 0.17, True, unit * 0.8)
+        _cloud(draw, cx - s * 0.04, cy + s * 0.14, s * 0.76)
+        return
+
+    if code == 3:                                   # overcast
+        _cloud(draw, cx, cy, s * 0.88)
+        return
+
+    if code in (45, 48):                            # fog
+        _cloud(draw, cx, cy - s * 0.12, s * 0.80)
+        for i in range(3):
+            yy = cy + s * (0.24 + i * 0.13)
+            draw.line((x + s * 0.16, yy, x + s * 0.84, yy), fill=BLACK, width=int(unit))
+        return
+
+    if code in (95, 96, 99):                        # thunderstorm: yellow bolt
+        _cloud(draw, cx, cy - s * 0.14, s * 0.82)
+        bx, by = cx, cy + s * 0.16
+        draw.polygon([(bx + s * 0.06, by), (bx - s * 0.13, by + s * 0.20),
+                      (bx - s * 0.01, by + s * 0.20), (bx - s * 0.08, by + s * 0.40),
+                      (bx + s * 0.16, by + s * 0.14), (bx + s * 0.02, by + s * 0.14)],
+                     fill=YELLOW)
+        return
+
+    if code in (71, 73, 75, 85, 86):                # snow
+        _cloud(draw, cx, cy - s * 0.12, s * 0.80)
+        for i in range(3):
+            fx = x + s * (0.26 + i * 0.24)
+            fy = cy + s * 0.30
+            r = s * 0.055
+            draw.ellipse((fx - r, fy - r, fx + r, fy + r), fill=BLACK)
+        return
+
+    # everything else: rain. Red drops so they read against the black cloud.
+    _cloud(draw, cx, cy - s * 0.12, s * 0.80)
+    for i in range(3):
+        dx = x + s * (0.28 + i * 0.22)
+        dy = cy + s * 0.22
+        draw.line((dx, dy, dx - s * 0.06, dy + s * 0.20), fill=RED, width=int(unit))
+
+
+def weather_icon_color(name):
+    """Tint a weather glyph to match what it depicts.
+
+    The panel only has black/yellow/red, so: anything sun-like is yellow,
+    storms are red (they are the condition worth noticing), and cloud/rain/snow
+    stay black - a yellow raincloud just reads as broken.
+    """
+    if name in ("icon_sun", "icon_moon", "icon_partly-cloudy-day", "icon_night"):
+        return YELLOW
+    if name in ("icon_storm", "icon_cloud-lightning"):
+        return RED
+    return BLACK
 
 
 def get_weather_icon(code, is_day=1):
@@ -872,7 +1237,7 @@ def get_weather_icon(code, is_day=1):
 
 
 def render_screen(epd, fonts):
-    Himage = Image.new('1', (epd.width, epd.height), 255)
+    Himage = Image.new('RGB', (epd.width, epd.height), WHITE)
     draw = ImageDraw.Draw(Himage)
 
     if not data_store.lock.acquire(timeout=2.0): return Himage
@@ -890,6 +1255,8 @@ def render_screen(epd, fonts):
         sysload = data_store.sysload.copy()
         crypto = data_store.crypto.copy()
         ping = data_store.ping.copy()
+        movers = data_store.movers.copy()
+        fritz = data_store.fritz.copy()
     finally:
         data_store.lock.release()
 
@@ -898,124 +1265,174 @@ def render_screen(epd, fonts):
     # --- COLUMN 1 (Widgets) ---
     col1_x = 20
 
-    # Widget 1: Strava or SysLoad
-    y1 = 20
+    # Four stacked slots across the 480px height, ~113px each including its
+    # separator. Tighter than the original three-slot layout, so the crypto
+    # widget at the bottom is drawn in a compact two-row form.
+    y1, y2, y3, y4 = 15, 128, 241, 354
+    SEP1, SEP2, SEP3 = 118, 231, 344
+
+    # Widget 1: Strava or Internet Quality
     if ENABLE_STRAVA:
-        draw_icon(draw, col1_x, y1, "icon_strava", (60, 60))
-        draw.text((col1_x + 70, y1), "STRAVA STATS", font=fonts['28'], fill=0)
+        draw_icon(draw, col1_x, y1, "icon_strava", (50, 50), color=RED)
+        draw.text((col1_x + 60, y1), "STRAVA STATS", font=fonts['28'], fill=BLACK)
 
         now_y = datetime.now().year
-        draw.text((col1_x + 70, y1 + 35),
+        draw.text((col1_x + 60, y1 + 30),
                   f"{now_y}: {strava.get('distance_curr', 0)} km | {now_y - 1}: {strava.get('distance_prev', 0)} km",
-                  font=fonts['20'], fill=0)
-        draw.text((col1_x + 70, y1 + 60),
+                  font=fonts['20'], fill=BLACK)
+        draw.text((col1_x + 60, y1 + 52),
                   f"Total: {strava.get('total_distance', 0)} km | {strava.get('rides', 0)} acts", font=fonts['20'],
-                  fill=0)
+                  fill=BLACK)
 
-        draw_icon(draw, col1_x + 70, y1 + 85, "icon_bike", (30, 30))
-        draw.text((col1_x + 105, y1 + 90), f"{strava.get('bike_total', 0)} km", font=fonts['20'], fill=0)
+        draw_icon(draw, col1_x + 60, y1 + 74, "icon_bike", (26, 26), color=RED)
+        draw.text((col1_x + 92, y1 + 76), f"{strava.get('bike_total', 0)} km", font=fonts['20'], fill=BLACK)
 
-        draw_icon(draw, col1_x + 220, y1 + 85, "icon_hike", (30, 30))
-        draw.text((col1_x + 255, y1 + 90), f"{strava.get('hike_total', 0)} km", font=fonts['20'], fill=0)
+        draw_icon(draw, col1_x + 210, y1 + 74, "icon_hike", (26, 26), color=RED)
+        draw.text((col1_x + 242, y1 + 76), f"{strava.get('hike_total', 0)} km", font=fonts['20'], fill=BLACK)
+
+    elif ENABLE_PHRASE:
+        # Speech bubble, drawn rather than tinted: a flat yellow body with a
+        # black outline reads far better than yellow line art would.
+        # The slot is only ~100px tall and this stacks four rows, so the
+        # vertical rhythm is tight: header, two German lines, one English.
+        draw.ellipse((col1_x, y1 + 2, col1_x + 20, y1 + 22), fill=YELLOW, outline=BLACK, width=2)
+        draw.text((col1_x + 28, y1 + 1), "PHRASE OF THE DAY", font=fonts['20'], fill=BLACK)
+
+        _de, _en = phrase_of_the_day()
+        _w = col_w - 60
+        _yy = y1 + 28
+        for _line in wrap_text(draw, _de, fonts['24'], _w, max_lines=2):
+            draw.text((col1_x, _yy), _line, font=fonts['24'], fill=BLACK)
+            _yy += 22
+        for _line in wrap_text(draw, _en, fonts['20'], _w, max_lines=1):
+            draw.text((col1_x, _yy + 2), _line, font=fonts['20'], fill=RED)
 
     else:
-        draw_icon(draw, col1_x, y1, "icon_cpu", (50, 50))
-        draw.text((col1_x + 60, y1), f"SYSTEM LOAD: {sysload['cpu']}%", font=fonts['28'], fill=0)
-        draw.text((col1_x + 60, y1 + 35), f"RAM Free: {sysload['ram_free']} MB", font=fonts['20'], fill=0)
-        draw_sparkline(draw, col1_x + 60, y1 + 60, list(sysload['history']), max_items=30, width=350, height=40,
-                       style="bar")
+        draw_icon(draw, col1_x, y1, "icon_wifi", (50, 50), color=RED)
+        draw.text((col1_x + 60, y1), f"Internet Quality: {ping['current']} ms", font=fonts['28'], fill=BLACK)
+        draw_sparkline(draw, col1_x + 60, y1 + 56, list(ping['history']), max_items=50, width=350, height=34,
+                       style="bar", color=RED)
 
-    draw.line((col1_x, 150, col_w - 20, 150), fill=0, width=2)
+    draw.line((col1_x, SEP1, col_w - 20, SEP1), fill=RED, width=2)
 
-    # Widget 2: Bambu or Crypto
-    y2 = 170
+    # Widget 2: Bambu printer. Crypto has its own slot now, so there is no
+    # fallback here - the slot simply stays empty when the printer is disabled.
     if ENABLE_BAMBU:
         p_status = str(printer.get('status', 'OFFLINE')).upper()
-        draw_icon(draw, col1_x, y2, "icon_3d", (60, 60))
-        draw.text((col1_x + 70, y2), f"PRINTER: {p_status}", font=fonts['28'], fill=0)
+        draw_icon(draw, col1_x, y2, "icon_3d", (50, 50), color=RED)
+        draw.text((col1_x + 60, y2), f"PRINTER: {p_status}", font=fonts['28'], fill=BLACK)
         if p_status not in ["OFFLINE", "UNKNOWN", "FINISH"]:
             percent = printer.get('percentage', 0)
-            draw.rectangle((col1_x + 70, y2 + 40, col1_x + 400, y2 + 60), outline=0)
-            draw.rectangle((col1_x + 70, y2 + 40, col1_x + 70 + int(330 * (percent / 100)), y2 + 60), fill=0)
-            draw.text((col1_x + 70, y2 + 70),
+            draw.rectangle((col1_x + 60, y2 + 38, col1_x + 390, y2 + 56), outline=BLACK)
+            draw.rectangle((col1_x + 62, y2 + 40, col1_x + 60 + int(330 * (percent / 100)), y2 + 54), fill=YELLOW)
+            draw.text((col1_x + 60, y2 + 62),
                       f"{percent}% | Rem: {printer.get('remaining_time', '0')}m | {printer.get('layers', '0/0')} L",
-                      font=fonts['20'], fill=0)
-    else:
-        draw_icon(draw, col1_x, y2, "icon_btc", (50, 50))
-        draw.text((col1_x + 60, y2), f"BTC: ${crypto['btc']}", font=fonts['28'], fill=0)
-        draw_sparkline(draw, col1_x + 60, y2 + 35, crypto['btc_hist'], max_items=50, width=350, height=35, style="bar")
+                      font=fonts['20'], fill=BLACK)
 
-        draw_icon(draw, col1_x, y2 + 80, "icon_eth", (50, 50))
-        draw.text((col1_x + 60, y2 + 80), f"ETH: ${crypto['eth']}", font=fonts['28'], fill=0)
-        draw_sparkline(draw, col1_x + 60, y2 + 115, crypto['eth_hist'], max_items=50, width=350, height=35, style="bar")
+    draw.line((col1_x, SEP2, col_w - 20, SEP2), fill=RED, width=2)
 
-    draw.line((col1_x, 320, col_w - 20, 320), fill=0, width=2)
-
-    # Widget 3: Roborock or Ping
-    y3 = 340
+    # Widget 3: Roborock / Antigravity / Codex / System load
     if ENABLE_ROBOROCK:
-        draw_icon(draw, col1_x, y3, "icon_roborock", (50, 50))
-        draw.text((col1_x + 60, y3), f"Bat: {rob['battery']}% | {rob['status']}", font=fonts['28'], fill=0)
+        draw_icon(draw, col1_x, y3, "icon_roborock", (50, 50), color=RED)
+        draw.text((col1_x + 60, y3), f"Bat: {rob['battery']}% | {rob['status']}", font=fonts['28'], fill=BLACK)
         if rob['is_cleaning']:
-            draw.text((col1_x + 60, y3 + 35), f"Clean: {rob['current_area']:.1f} m2 ({rob['pct']:.0f}%)",
-                      font=fonts['24'], fill=0)
+            draw.text((col1_x + 60, y3 + 34), f"Clean: {rob['current_area']:.1f} m2 ({rob['pct']:.0f}%)",
+                      font=fonts['24'], fill=BLACK)
             clamped_pct = min(rob['pct'], 100)
-            draw.rectangle((col1_x + 60, y3 + 70, col1_x + 390, y3 + 90), outline=0)
-            draw.rectangle((col1_x + 60, y3 + 70, col1_x + 60 + int(330 * (clamped_pct / 100)), y3 + 90), fill=0)
+            draw.rectangle((col1_x + 60, y3 + 64, col1_x + 390, y3 + 82), outline=BLACK)
+            draw.rectangle((col1_x + 62, y3 + 66, col1_x + 60 + int(330 * (clamped_pct / 100)), y3 + 80), fill=YELLOW)
         else:
-            draw.text((col1_x + 60, y3 + 35), f"Last: {rob['last_date']} | {rob['ref_area']:.1f} m2", font=fonts['24'],
-                      fill=0)
+            draw.text((col1_x + 60, y3 + 34), f"Last: {rob['last_date']} | {rob['ref_area']:.1f} m2", font=fonts['24'],
+                      fill=BLACK)
     elif ENABLE_ANTIGRAVITY:
-        draw_icon(draw, col1_x, y3, "icon_cpu", (50, 50))
-        draw.text((col1_x + 60, y3), "ANTIGRAVITY USAGE", font=fonts['28'], fill=0)
-        
+        draw_icon(draw, col1_x, y3, "icon_cpu", (50, 50), color=RED)
+        draw.text((col1_x + 60, y3), "ANTIGRAVITY USAGE", font=fonts['28'], fill=BLACK)
+
         if antigravity.get('error'):
-            draw.text((col1_x + 60, y3 + 35), "Error loading data", font=fonts['20'], fill=0)
+            draw.text((col1_x + 60, y3 + 34), "Error loading data", font=fonts['20'], fill=BLACK)
         else:
             models = antigravity.get('models', [])
             opus = next((m for m in models if m.get('modelId') == 'claude-opus-4-6-thinking'), None)
             gemini = next((m for m in models if m.get('modelId') == 'gemini-3-pro-high'), None)
-            
-            y_off = y3 + 35
+
+            y_off = y3 + 32
             for m_data in (opus, gemini):
                 if m_data:
                     label = "Opus 4.6" if m_data.get('modelId') == 'claude-opus-4-6-thinking' else "Gemini 3Pro"
                     pct = m_data.get('usedPercentage', 0)
                     rem_time = time_until(m_data.get('resetDate'))
-                    
-                    draw.text((col1_x + 60, y_off), f"{label} {pct}% | In {rem_time}", font=fonts['20'], fill=0)
-                    
-                    bx, bw, bh = col1_x + 60, 330, 15
-                    draw.rectangle((bx, y_off + 25, bx + bw, y_off + 25 + bh), outline=0, width=2)
+
+                    draw.text((col1_x + 60, y_off), f"{label} {pct}% | In {rem_time}", font=fonts['20'], fill=BLACK)
+
+                    bx, bw, bh = col1_x + 60, 330, 13
+                    draw.rectangle((bx, y_off + 22, bx + bw, y_off + 22 + bh), outline=BLACK, width=2)
                     fill_w = int((bw - 4) * min(pct / 100.0, 1.0))
-                    if fill_w > 0: draw.rectangle((bx + 2, y_off + 27, bx + 2 + fill_w, y_off + 25 + bh - 2), fill=0)
-                    
-                    y_off += 50
+                    if fill_w > 0: draw.rectangle((bx + 2, y_off + 24, bx + 2 + fill_w, y_off + 22 + bh - 2), fill=YELLOW)
+
+                    y_off += 40
     elif ENABLE_CODEX:
-        draw_icon(draw, col1_x, y3, "icon_cpu", (50, 50))
-        draw.text((col1_x + 60, y3), "CODEX AI USAGE", font=fonts['28'], fill=0)
+        draw_icon(draw, col1_x, y3, "icon_cpu", (50, 50), color=RED)
+        draw.text((col1_x + 60, y3), "CODEX AI USAGE", font=fonts['28'], fill=BLACK)
 
         if codex.get('error'):
-            draw.text((col1_x + 60, y3 + 40), "Codex Usage Error", font=fonts['20'], fill=0)
+            draw.text((col1_x + 60, y3 + 34), "Codex Usage Error", font=fonts['20'], fill=BLACK)
         else:
             # 7-Day limit only: OpenAI has disabled the 5-hour window for now.
             pct_7d = codex.get('seven_day', {}).get('utilization', 0)
             resets_7d = codex.get('seven_day', {}).get('resets_at')
             rem_7d = time_until(resets_7d)
 
-            draw.text((col1_x + 60, y3 + 40), f"7-Day Limit: {round(pct_7d)}% (In {rem_7d})",
-                      font=fonts['20'], fill=0)
-            bx, bw, bh = col1_x + 60, 330, 15
-            draw.rectangle((bx, y3 + 70, bx + bw, y3 + 70 + bh), outline=0, width=2)
+            draw.text((col1_x + 60, y3 + 34), f"7-Day Limit: {round(pct_7d)}% (In {rem_7d})",
+                      font=fonts['20'], fill=BLACK)
+            bx, bw, bh = col1_x + 60, 330, 13
+            draw.rectangle((bx, y3 + 64, bx + bw, y3 + 64 + bh), outline=BLACK, width=2)
             fill_w = int((bw - 4) * min(pct_7d / 100.0, 1.0))
             if fill_w > 0:
-                draw.rectangle((bx + 2, y3 + 72, bx + 2 + fill_w, y3 + 70 + bh - 2), fill=0)
+                draw.rectangle((bx + 2, y3 + 66, bx + 2 + fill_w, y3 + 64 + bh - 2), fill=YELLOW)
     else:
-        draw_icon(draw, col1_x, y3, "icon_wifi", (50, 50))
-        draw.text((col1_x + 60, y3), f"Internet Quality: {ping['current']} ms", font=fonts['28'], fill=0)
-        draw_sparkline(draw, col1_x, y3 + 60, list(ping['history']), max_items=50, width=400, height=40, style="bar")
+        draw_icon(draw, col1_x, y3, "icon_cpu", (50, 50), color=RED)
+        draw.text((col1_x + 60, y3), f"SYSTEM LOAD: {sysload['cpu']}%", font=fonts['28'], fill=BLACK)
+        draw.text((col1_x + 60, y3 + 34), f"RAM Free: {sysload['ram_free']} MB", font=fonts['20'], fill=BLACK)
+        draw_sparkline(draw, col1_x + 60, y3 + 60, list(sysload['history']), max_items=30, width=350, height=26,
+                       style="bar", color=RED)
 
-    draw.line((col_w, 10, col_w, 470), fill=0, width=2)
+    draw.line((col1_x, SEP3, col_w - 20, SEP3), fill=RED, width=2)
+
+    # Widget 4: Coinbase 24h movers - four columns, gainers over losers.
+    draw_icon(draw, col1_x, y4, "icon_btc", (26, 26), color=YELLOW)
+    draw.text((col1_x + 34, y4 + 1), "COINBASE 24h MOVERS", font=fonts['20'], fill=BLACK)
+
+    _cell_w = 98
+    # Yellow is unreadable as small text on this panel - it only works as a
+    # large solid fill. So direction is carried by a chunky yellow/red triangle
+    # and the numbers stay high-contrast.
+    for _row, (_key, _colour, _up) in enumerate((('gainers', YELLOW, True), ('losers', RED, False))):
+        _entries = movers.get(_key) or []
+        _ry = y4 + 28 + _row * 40
+        for _i in range(4):
+            _cx = col1_x + _i * _cell_w
+            if _i >= len(_entries):
+                draw.text((_cx, _ry), "-", font=fonts['20'], fill=BLACK)
+                continue
+            _sym, _pct = _entries[_i]
+            # Only a couple of coins ship an icon (BTC, ETH); fall back to the
+            # ticker text for everything else.
+            _tx = _cx
+            if os.path.exists(os.path.join(ICON_DIR, f"icon_{_sym.lower()}.bmp")):
+                draw_icon(draw, _cx, _ry + 1, f"icon_{_sym.lower()}", (16, 16), color=BLACK)
+                _tx = _cx + 20
+            draw.text((_tx, _ry), _sym[:6], font=fonts['20'], fill=BLACK)
+
+            _ax, _ay = _cx + 5, _ry + 22
+            if _up:
+                draw.polygon([(_ax, _ay + 11), (_ax + 10, _ay + 11), (_ax + 5, _ay)], fill=YELLOW)
+                draw.polygon([(_ax, _ay + 11), (_ax + 10, _ay + 11), (_ax + 5, _ay)], outline=BLACK)
+            else:
+                draw.polygon([(_ax, _ay), (_ax + 10, _ay), (_ax + 5, _ay + 11)], fill=RED)
+            draw.text((_cx + 20, _ry + 18), f"{abs(_pct):.1f}%", font=fonts['20'],
+                      fill=BLACK if _up else RED)
+
+    draw.line((col_w, 10, col_w, 470), fill=RED, width=2)
 
     # --- COLUMN 2 (Weather) ---
     col2_x = col_w + 20
@@ -1033,12 +1450,12 @@ def render_screen(epd, fonts):
 
         temp_rounded = math.floor(temp + 0.5)
 
-        draw_icon(draw, col2_x, 20, get_weather_icon(w_code, is_day), (90, 90))
-        draw.text((col2_x + 100, 10), f"{temp_rounded}°C", font=fonts['80'], fill=0)
+        draw_weather_glyph(draw, col2_x, 20, 90, w_code, is_day)
+        draw.text((col2_x + 100, 10), f"{temp_rounded}°C", font=fonts['80'], fill=RED)
 
         uv_x, uv_y = col2_x + 320, 25
         uv_rounded = math.floor(uv_index + 0.5)
-        draw.text((uv_x, uv_y), "UV", font=fonts['28'], fill=0)
+        draw.text((uv_x, uv_y), "UV", font=fonts['28'], fill=BLACK)
         uv_val_str = str(uv_rounded)
         try:
             bbox = draw.textbbox((0, 0), uv_val_str, font=fonts['60'])
@@ -1049,33 +1466,33 @@ def render_screen(epd, fonts):
         uv_val_x, uv_val_y = uv_x + 45, 5
         if uv_rounded >= 6:
             pad = 5
-            draw.rectangle((uv_val_x - pad, uv_val_y - pad + 10, uv_val_x + tw + pad, uv_val_y + th + pad), fill=0)
-            draw.text((uv_val_x, uv_val_y), uv_val_str, font=fonts['60'], fill=255)
+            draw.rectangle((uv_val_x - pad, uv_val_y - pad + 10, uv_val_x + tw + pad, uv_val_y + th + pad), fill=RED)
+            draw.text((uv_val_x, uv_val_y), uv_val_str, font=fonts['60'], fill=WHITE)
         else:
-            draw.text((uv_val_x, uv_val_y), uv_val_str, font=fonts['60'], fill=0)
+            draw.text((uv_val_x, uv_val_y), uv_val_str, font=fonts['60'], fill=BLACK)
 
-        draw.text((col2_x + 100, 95), f"Humidity: {hum}%", font=fonts['20'], fill=0)
-        draw.text((col2_x + 100, 120), f"Press: {pres} hPa", font=fonts['20'], fill=0)
+        draw.text((col2_x + 100, 95), f"Humidity: {hum}%", font=fonts['20'], fill=BLACK)
+        draw.text((col2_x + 100, 120), f"Press: {pres} hPa", font=fonts['20'], fill=BLACK)
 
-        draw.line((col2_x, 140, col2_x + col_w - 40, 140), fill=0, width=2)
+        draw.line((col2_x, 140, col2_x + col_w - 40, 140), fill=RED, width=2)
 
         y_c2 = 160
-        draw_icon(draw, col2_x + 5, y_c2, "icon_wind", (30, 30))
+        draw_icon(draw, col2_x + 5, y_c2, "icon_wind", (30, 30), color=RED)
 
         cx, cy, r = col2_x + 80, y_c2 + 80, 60
-        draw.ellipse((cx - r, cy - r, cx + r, cy + r), outline=0, width=2)
+        draw.ellipse((cx - r, cy - r, cx + r, cy + r), outline=BLACK, width=2)
 
         for angle in range(0, 360, 45):
             rad_tick = math.radians(angle)
             inner_r = r - 8 if angle % 90 == 0 else r - 4
             tx1, ty1 = cx + inner_r * math.cos(rad_tick), cy + inner_r * math.sin(rad_tick)
             tx2, ty2 = cx + r * math.cos(rad_tick), cy + r * math.sin(rad_tick)
-            draw.line((tx1, ty1, tx2, ty2), fill=0, width=2)
+            draw.line((tx1, ty1, tx2, ty2), fill=RED, width=2)
 
-        draw.text((cx - 8, cy - r - 22), "N", font=fonts['20'], fill=0)
-        draw.text((cx - 8, cy + r + 4), "S", font=fonts['20'], fill=0)
-        draw.text((cx + r + 6, cy - 10), "E", font=fonts['20'], fill=0)
-        draw.text((cx - r - 24, cy - 10), "W", font=fonts['20'], fill=0)
+        draw.text((cx - 8, cy - r - 22), "N", font=fonts['20'], fill=BLACK)
+        draw.text((cx - 8, cy + r + 4), "S", font=fonts['20'], fill=BLACK)
+        draw.text((cx + r + 6, cy - 10), "E", font=fonts['20'], fill=BLACK)
+        draw.text((cx - r - 24, cy - 10), "W", font=fonts['20'], fill=BLACK)
 
         rad_arrow = math.radians(wind_dir - 90)
         tip_x = cx + (r - 12) * math.cos(rad_arrow)
@@ -1085,8 +1502,8 @@ def render_screen(epd, fonts):
         left_y = cy + 20 * math.sin(rad_arrow + base_angle)
         right_x = cx + 20 * math.cos(rad_arrow - base_angle)
         right_y = cy + 20 * math.sin(rad_arrow - base_angle)
-        draw.polygon([(tip_x, tip_y), (left_x, left_y), (right_x, right_y)], fill=0)
-        draw.ellipse((cx - 4, cy - 4, cx + 4, cy + 4), fill=0)
+        draw.polygon([(tip_x, tip_y), (left_x, left_y), (right_x, right_y)], fill=RED)
+        draw.ellipse((cx - 4, cy - 4, cx + 4, cy + 4), fill=RED)
 
         spd_text = f"{wind_spd} km/h"
         try:
@@ -1095,11 +1512,11 @@ def render_screen(epd, fonts):
         except AttributeError:
             tw = draw.textsize(spd_text, font=fonts['20'])[0]
 
-        draw.text((cx - tw / 2, cy + 25), spd_text, font=fonts['20'], fill=0)
+        draw.text((cx - tw / 2, cy + 25), spd_text, font=fonts['20'], fill=BLACK)
 
         aqi_x = col2_x + 180
-        draw.text((aqi_x, y_c2 + 10), "AIR QUALITY", font=fonts['20'], fill=0)
-        draw.text((aqi_x, y_c2 + 55), "AQI:", font=fonts['28'], fill=0)
+        draw.text((aqi_x, y_c2 + 10), "AIR QUALITY", font=fonts['20'], fill=BLACK)
+        draw.text((aqi_x, y_c2 + 55), "AQI:", font=fonts['28'], fill=BLACK)
 
         aqi_str = str(aqi)
         try:
@@ -1112,12 +1529,12 @@ def render_screen(epd, fonts):
 
         if aqi >= 50:
             pad = 20
-            draw.rectangle((val_x - pad, val_y - pad + 15, val_x + tw + pad, val_y + th + pad - 5), fill=0)
-            draw.text((val_x, val_y), aqi_str, font=fonts['80'], fill=255)
+            draw.rectangle((val_x - pad, val_y - pad + 15, val_x + tw + pad, val_y + th + pad - 5), fill=RED)
+            draw.text((val_x, val_y), aqi_str, font=fonts['80'], fill=WHITE)
         else:
-            draw.text((val_x, val_y), aqi_str, font=fonts['80'], fill=0)
+            draw.text((val_x, val_y), aqi_str, font=fonts['80'], fill=BLACK)
 
-        draw.line((col2_x, 320, col2_x + col_w - 40, 320), fill=0, width=2)
+        draw.line((col2_x, 320, col2_x + col_w - 40, 320), fill=RED, width=2)
 
         hourly = weather.get('hourly', {})
         times = hourly.get('time', [])
@@ -1134,65 +1551,66 @@ def render_screen(epd, fonts):
             idx = start_idx + i
             if idx < len(times):
                 off_x = col2_x + (i * 105)
-                draw.text((off_x + 10, 340), f"{times[idx].split('T')[1][:5]}", font=fonts['24'], fill=0)
-                draw_icon(draw, off_x + 15, 375, get_weather_icon(codes[idx], 1), (60, 60))
+                draw.text((off_x + 10, 340), f"{times[idx].split('T')[1][:5]}", font=fonts['24'], fill=BLACK)
+                draw_weather_glyph(draw, off_x + 15, 375, 60, codes[idx], 1)
                 f_temp = math.floor(temps[idx] + 0.5)
-                draw.text((off_x + 15, 440), f"{f_temp}°C", font=fonts['24'], fill=0)
+                draw.text((off_x + 15, 440), f"{f_temp}°C", font=fonts['24'], fill=RED)
 
-    draw.line((col_w * 2, 10, col_w * 2, 470), fill=0, width=2)
+    draw.line((col_w * 2, 10, col_w * 2, 470), fill=RED, width=2)
 
     # --- COLUMN 3 (Time, Claude/Spotify/Progress, Gmail) ---
     col3_x = col_w * 2 + 30
     dt = datetime.now()
 
     # 1. Time & Date
-    draw.text((col3_x, 10), dt.strftime("%H:%M"), font=fonts['clock'], fill=0)
+    draw.text((col3_x, 10), dt.strftime("%H:%M"), font=fonts['clock'], fill=RED)
 
     date_str = dt.strftime("%d %B %Y")
     day_str = dt.strftime("%a").upper()
 
-    draw.text((col3_x, 170), date_str, font=fonts['32'], fill=0)
-    draw.text((col3_x + 340, 170), day_str, font=fonts['32'], fill=0)
+    draw.text((col3_x, 170), date_str, font=fonts['32'], fill=BLACK)
+    draw.text((col3_x + 340, 170), day_str, font=fonts['32'], fill=BLACK)
 
-    draw.line((col3_x, 220, epd.width - 20, 220), fill=0, width=2)
+    draw.line((col3_x, 220, epd.width - 20, 220), fill=RED, width=2)
 
     # 2. Claude AI OR Spotify OR Time Progress
     sp_y = 240
     # Clear background for widget
-    draw.rectangle((col3_x, sp_y, col3_x + 420, sp_y + 130), fill=255)
+    draw.rectangle((col3_x, sp_y, col3_x + 420, sp_y + 130), fill=WHITE)
 
     if ENABLE_CLAUDE:
-        draw.text((col3_x, sp_y), "CLAUDE AI USAGE", font=fonts['28'], fill=0)
+        draw_icon(draw, col3_x, sp_y - 2, "icon_claude", (34, 34), color=RED)
+        draw.text((col3_x + 44, sp_y), "CLAUDE AI USAGE", font=fonts['28'], fill=BLACK)
 
         if claude.get('error'):
-            draw.text((col3_x, sp_y + 50), "Claude Usage Error", font=fonts['24'], fill=0)
+            draw.text((col3_x, sp_y + 50), "Claude Usage Error", font=fonts['24'], fill=BLACK)
         else:
             # 5-Hour Limit
             pct_5h = claude.get('five_hour', {}).get('utilization', 0)
             resets_5h = claude.get('five_hour', {}).get('resets_at')
             rem_5h = time_until(resets_5h)
 
-            draw.text((col3_x, sp_y + 40), f"5-Hour Limit: {pct_5h}% (Resets in {rem_5h})", font=fonts['20'], fill=0)
+            draw.text((col3_x, sp_y + 40), f"5-Hour Limit: {pct_5h}% (Resets in {rem_5h})", font=fonts['20'], fill=BLACK)
             bx, bw, bh = col3_x, 400, 15
-            draw.rectangle((bx, sp_y + 65, bx + bw, sp_y + 65 + bh), outline=0, width=2)
+            draw.rectangle((bx, sp_y + 65, bx + bw, sp_y + 65 + bh), outline=BLACK, width=2)
             fill_w = int((bw - 4) * min(pct_5h / 100.0, 1.0))
-            if fill_w > 0: draw.rectangle((bx + 2, sp_y + 67, bx + 2 + fill_w, sp_y + 65 + bh - 2), fill=0)
+            if fill_w > 0: draw.rectangle((bx + 2, sp_y + 67, bx + 2 + fill_w, sp_y + 65 + bh - 2), fill=YELLOW)
 
             # 7-Day Limit
             pct_7d = claude.get('seven_day', {}).get('utilization', 0)
             resets_7d = claude.get('seven_day', {}).get('resets_at')
             rem_7d = time_until(resets_7d)
 
-            draw.text((col3_x, sp_y + 90), f"7-Day Limit: {pct_7d}% (Resets in {rem_7d})", font=fonts['20'], fill=0)
-            draw.rectangle((bx, sp_y + 115, bx + bw, sp_y + 115 + bh), outline=0, width=2)
+            draw.text((col3_x, sp_y + 90), f"7-Day Limit: {pct_7d}% (Resets in {rem_7d})", font=fonts['20'], fill=BLACK)
+            draw.rectangle((bx, sp_y + 115, bx + bw, sp_y + 115 + bh), outline=BLACK, width=2)
             fill_w = int((bw - 4) * min(pct_7d / 100.0, 1.0))
-            if fill_w > 0: draw.rectangle((bx + 2, sp_y + 117, bx + 2 + fill_w, sp_y + 115 + bh - 2), fill=0)
+            if fill_w > 0: draw.rectangle((bx + 2, sp_y + 117, bx + 2 + fill_w, sp_y + 115 + bh - 2), fill=YELLOW)
 
     elif ENABLE_SPOTIFY:
         if spotify['cover']:
             Himage.paste(spotify['cover'], (col3_x, sp_y))
         else:
-            draw_icon(draw, col3_x, sp_y, "icon_spotify", (120, 120))
+            draw_icon(draw, col3_x, sp_y, "icon_spotify", (120, 120), color=RED)
 
         status_ico = "icon_play" if spotify['status'] == 'PLAYING' else "icon_pause"
         draw_icon(draw, col3_x + 140, sp_y + 10, status_ico, (30, 30))
@@ -1201,13 +1619,13 @@ def render_screen(epd, fonts):
             words = spotify['text'].split(' - ')
             artist = words[0] if len(words) > 0 else "Unknown"
             track = words[1] if len(words) > 1 else ""
-            draw.text((col3_x + 180, sp_y + 10), artist[:20], font=fonts['28'], fill=0)
-            draw.text((col3_x + 140, sp_y + 50), track[:25], font=fonts['24'], fill=0)
+            draw.text((col3_x + 180, sp_y + 10), artist[:20], font=fonts['28'], fill=BLACK)
+            draw.text((col3_x + 140, sp_y + 50), track[:25], font=fonts['24'], fill=BLACK)
 
     else:
         # Fallback: Time Progress
         tp_y = sp_y
-        draw.text((col3_x, tp_y), "TIME PROGRESS", font=fonts['28'], fill=0)
+        draw.text((col3_x, tp_y), "TIME PROGRESS", font=fonts['28'], fill=BLACK)
 
         day_pct = (dt.hour * 3600 + dt.minute * 60 + dt.second) / 86400.0
         days_in_m = calendar.monthrange(dt.year, dt.month)[1]
@@ -1216,27 +1634,45 @@ def render_screen(epd, fonts):
         year_pct = (dt.timetuple().tm_yday - 1 + (dt.hour / 24.0)) / days_in_y
 
         def draw_prog(y_offset, label, pct):
-            draw.text((col3_x, tp_y + y_offset), label, font=fonts['24'], fill=0)
+            draw.text((col3_x, tp_y + y_offset), label, font=fonts['24'], fill=BLACK)
             bx = col3_x + 110
             bw = 200
             bh = 20
-            draw.rectangle((bx, tp_y + y_offset + 2, bx + bw, tp_y + y_offset + bh + 2), outline=0, width=2)
+            draw.rectangle((bx, tp_y + y_offset + 2, bx + bw, tp_y + y_offset + bh + 2), outline=BLACK, width=2)
             if pct > 0:
                 fill_w = int((bw - 4) * min(pct, 1.0))
                 if fill_w > 0:
-                    draw.rectangle((bx + 2, tp_y + y_offset + 4, bx + 2 + fill_w, tp_y + y_offset + bh), fill=0)
-            draw.text((bx + bw + 15, tp_y + y_offset), f"{int(pct * 100)}%", font=fonts['24'], fill=0)
+                    draw.rectangle((bx + 2, tp_y + y_offset + 4, bx + 2 + fill_w, tp_y + y_offset + bh), fill=YELLOW)
+            draw.text((bx + bw + 15, tp_y + y_offset), f"{int(pct * 100)}%", font=fonts['24'], fill=BLACK)
 
         draw_prog(40, "DAY", day_pct)
         draw_prog(75, "MONTH", month_pct)
         draw_prog(110, "YEAR", year_pct)
 
-    draw.line((col3_x, 380, epd.width - 20, 380), fill=0, width=2)
+    draw.line((col3_x, 380, epd.width - 20, 380), fill=RED, width=2)
 
-    # 3. Gmail
+    # 3. DSL line (Fritz!Box) or Gmail
     gm_y = 400
-    draw_icon(draw, col3_x, gm_y, "icon_mail", (60, 60))
-    draw.text((col3_x + 80, gm_y + 10), f"Unread Inbox: {gmail_unread}", font=fonts['35'], fill=0)
+    if ENABLE_FRITZBOX:
+        draw_icon(draw, col3_x, gm_y + 2, "icon_wifi", (44, 44), color=RED)
+        if fritz.get('ok'):
+            _dn = fritz['down_max'] / 1e6
+            _up = fritz['up_max'] / 1e6
+            draw.text((col3_x + 56, gm_y), f"DSL {_dn:.0f} / {_up:.0f} Mbps",
+                      font=fonts['28'], fill=BLACK)
+
+            # Latency belongs here too: the line can sync at full rate while
+            # routing is terrible, and sync rate alone would not show that.
+            _hrs = fritz['uptime'] // 3600
+            _now_mbps = fritz['down_now'] / 1e6
+            draw.text((col3_x + 56, gm_y + 34),
+                      f"Now {_now_mbps:.1f} Mbps | {ping['current']} ms | Up {_hrs // 24}d {_hrs % 24}h",
+                      font=fonts['20'], fill=BLACK)
+        else:
+            draw.text((col3_x + 56, gm_y + 8), "DSL link down", font=fonts['28'], fill=RED)
+    else:
+        draw_icon(draw, col3_x, gm_y, "icon_mail", (60, 60), color=RED)
+        draw.text((col3_x + 80, gm_y + 10), f"Unread Inbox: {gmail_unread}", font=fonts['35'], fill=BLACK)
 
     return Himage
 
@@ -1254,8 +1690,16 @@ def main():
 
     try:
         epd = epd10in85.EPD()
+        # Startup talks to the panel OUTSIDE the main loop's watchdog. If the
+        # panel is unplugged, half-seated or wedged, its BUSY line never
+        # releases and we would block here forever while systemd still reports
+        # the unit "active" - a wall display frozen on a stale frame with no
+        # error anywhere. Arm the watchdog so a dead panel exits non-zero and
+        # lets systemd retry us instead.
+        signal.alarm(120)
         epd.init()
         epd.Clear()
+        signal.alarm(0)
         time.sleep(1)
         epd.init_Part()
 
@@ -1283,6 +1727,19 @@ def main():
             t_robo.daemon = True
             t_robo.start()
 
+        # Let the fetch threads land their first results before the opening
+        # frame. Without this the first paint shows an empty weather column, and
+        # on this panel the next refresh is REFRESH_INTERVAL_SEC away - so a
+        # blank column would sit on the wall for minutes.
+        _wait_until = time.time() + 45
+        while time.time() < _wait_until:
+            with data_store.lock:
+                if 'current' in data_store.weather:
+                    break
+            time.sleep(1)
+        else:
+            logging.warning("First weather fetch did not arrive in time; painting anyway")
+
         refresh_counter = 0
 
         while True:
@@ -1304,8 +1761,8 @@ def main():
                     signal.alarm(0)
                     refresh_counter = 0
                 else:
-                    logging.debug("Partial Refresh")
-                    signal.alarm(30)  # watchdog guards only the SPI/BUSY transfer
+                    logging.debug("Display refresh")
+                    signal.alarm(90)  # no partial mode here: every refresh is a full ~18s one
                     # On the Pi Zero 1 the panel reliably completes only the
                     # FIRST partial after an init: afterwards the controller
                     # latches BUSY low forever. init_Part() does a hardware reset
@@ -1335,9 +1792,22 @@ def main():
                 logging.error(f"Unexpected error in main: {e}")
 
             elapsed = time.time() - start_time
-            sleep_time = max(5, 60 - elapsed)
+            sleep_time = max(5, REFRESH_INTERVAL_SEC - elapsed)
             time.sleep(sleep_time)
 
+    except HardwareTimeoutError:
+        # Panel never released BUSY during startup. Exit non-zero so systemd
+        # retries rather than leaving the unit "active" on a frozen frame.
+        logging.critical(
+            "Panel did not respond during startup (BUSY never released). "
+            "Check the ribbon cables and the HAT seating."
+        )
+        try:
+            signal.alarm(0)
+            epd10in85.epdconfig.module_exit(cleanup=True)
+        except Exception:
+            pass
+        sys.exit(1)
     except KeyboardInterrupt:
         try:
             signal.alarm(0)

@@ -1,0 +1,76 @@
+name: Build Debian package
+
+on:
+  push:
+    branches: [main, master]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Derive version
+        id: ver
+        run: |
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=0.1.0+git$(date -u +%Y%m%d).$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Syntax check
+        run: |
+          python3 -m compileall -q main.py claude.py codex.py antigravity.py lib
+
+      - name: Build .deb
+        run: |
+          chmod +x packaging/build-deb.sh
+          packaging/build-deb.sh "${{ steps.ver.outputs.version }}"
+
+      - name: Verify package
+        run: |
+          deb=$(ls dist/*.deb)
+          echo "::group::metadata"
+          dpkg-deb --info "$deb"
+          echo "::endgroup::"
+          echo "::group::contents"
+          dpkg-deb --contents "$deb"
+          echo "::endgroup::"
+
+          # lintian is advisory: it flags plenty that does not matter for a
+          # private package, so never fail the build on it.
+          sudo apt-get update -qq && sudo apt-get install -y -qq lintian >/dev/null
+          lintian --no-tag-display-limit "$deb" || true
+
+          # These MUST hold: no credentials or local state may ever ship.
+          # Note the leading slash on config.py - without it this also matches
+          # the driver's epdconfig.py and fails every build.
+          contents=$(dpkg-deb --contents "$deb")
+          for bad in '/config\.py$' 'claude_creds' 'roborock_session' '/token\.json$' 'usage\.json' '\.pkl$' '\.log$'; do
+            if echo "$contents" | grep -E "opt/epaper-dashboard/.*${bad}"; then
+              echo "::error::package contains secret/state matching '${bad}'"
+              exit 1
+            fi
+          done
+
+          # the shipped config must be the example, registered as a conffile
+          dpkg-deb --fsys-tarfile "$deb" | tar -tf - | grep -q './etc/epaper-dashboard/config.py' \
+            || { echo "::error::config.py missing from /etc"; exit 1; }
+          dpkg-deb --field "$deb" Conffiles 2>/dev/null || true
+          echo "package verified"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: epaper-dashboard-deb
+          path: dist/*.deb
+          if-no-files-found: error
+
+      - name: Attach to release
+        if: github.ref_type == 'tag'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.deb

@@ -1,0 +1,27 @@
+# Local configuration - holds credentials, never commit it.
+# Use packaging/config.example.py as the template instead.
+config.py
+
+# Tokens, sessions and other state written at runtime
+*token*.json
+claude_creds.json
+auth.json
+usage.json
+roborock_stats.json
+*.pkl
+
+# Logs
+*.log
+
+# Build output
+dist/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Editor / merge leftovers
+*.orig
+*.rej
+*~

@@ -1,0 +1,25 @@
+[Unit]
+Description=Waveshare 10.85" e-Paper Dashboard
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/epaper-dashboard
+Environment=PYTHONUNBUFFERED=1
+Environment=EPAPER_CONFIG=/etc/epaper-dashboard/config.py
+ExecStart=/usr/bin/python3 /opt/epaper-dashboard/main.py
+Restart=on-failure
+RestartSec=30
+
+# main.py powers the panel down and releases GPIO in its KeyboardInterrupt
+# handler, so send SIGINT rather than SIGTERM for a graceful shutdown.
+KillSignal=SIGINT
+TimeoutStopSec=60
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
