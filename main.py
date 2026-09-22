@@ -1321,10 +1321,12 @@ def render_screen(epd, fonts):
         p_status = str(printer.get('status', 'OFFLINE')).upper()
         draw_icon(draw, col1_x, y2, "icon_3d", (50, 50), color=RED)
         draw.text((col1_x + 60, y2), f"PRINTER: {p_status}", font=fonts['28'], fill=BLACK)
-        if p_status not in ["OFFLINE", "UNKNOWN", "FINISH"]:
+        if p_status not in ["OFFLINE", "UNKNOWN", "FINISH", "IDLE"]:
             percent = printer.get('percentage', 0)
             draw.rectangle((col1_x + 60, y2 + 38, col1_x + 390, y2 + 56), outline=BLACK)
-            draw.rectangle((col1_x + 62, y2 + 40, col1_x + 60 + int(330 * (percent / 100)), y2 + 54), fill=YELLOW)
+            fill_w = int(326 * min(max(percent, 0), 100) / 100)
+            if fill_w > 0:
+                draw.rectangle((col1_x + 62, y2 + 40, col1_x + 62 + fill_w, y2 + 54), fill=YELLOW)
             draw.text((col1_x + 60, y2 + 62),
                       f"{percent}% | Rem: {printer.get('remaining_time', '0')}m | {printer.get('layers', '0/0')} L",
                       font=fonts['20'], fill=BLACK)
@@ -1340,7 +1342,9 @@ def render_screen(epd, fonts):
                       font=fonts['24'], fill=BLACK)
             clamped_pct = min(rob['pct'], 100)
             draw.rectangle((col1_x + 60, y3 + 64, col1_x + 390, y3 + 82), outline=BLACK)
-            draw.rectangle((col1_x + 62, y3 + 66, col1_x + 60 + int(330 * (clamped_pct / 100)), y3 + 80), fill=YELLOW)
+            fill_w = int(326 * min(max(clamped_pct, 0), 100) / 100)
+            if fill_w > 0:
+                draw.rectangle((col1_x + 62, y3 + 66, col1_x + 62 + fill_w, y3 + 80), fill=YELLOW)
         else:
             draw.text((col1_x + 60, y3 + 34), f"Last: {rob['last_date']} | {rob['ref_area']:.1f} m2", font=fonts['24'],
                       fill=BLACK)
@@ -1789,7 +1793,7 @@ def main():
                     os.execv(sys.executable, ['python'] + sys.argv)
             except Exception as e:
                 signal.alarm(0)
-                logging.error(f"Unexpected error in main: {e}")
+                logging.error(f"Unexpected error in main: {e}", exc_info=True)
 
             elapsed = time.time() - start_time
             sleep_time = max(5, REFRESH_INTERVAL_SEC - elapsed)
