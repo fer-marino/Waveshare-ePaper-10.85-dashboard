@@ -1,161 +1,270 @@
-# Waveshare-ePaper-10.85 Dashboard
+# Waveshare-ePaper-10.85 Dashboard (Orange Pi / 4-colour fork)
 
-A fully functional E-ink dashboard running on a Raspberry Pi Zero 1W or 2W. Designed for large Waveshare e-Paper displays (e.g., 10.85"), this project aggregates essential daily information and smart home status into a clean, minimalist interface.
+An e-ink dashboard for the Waveshare 10.85" e-Paper HAT+, showing weather, air quality, the time, smart-home devices and AI usage limits on one screen.
 
-## Key Features
-* **(NEW!) Now supporting both Raspberry Pi Zero 1 & 2!**
-* **(NEW!) Codex usage data:** Displays usage data for Codex, showing the limit, and limit reset time.
-* **Antigravity usage data:** Displays usage data for Antigravity, showing the limit, and limit reset time.
-* **Claude Code usage data:** Displays usage data for Claude Code, showing the daily limit, weekly limit, and limit reset time.
-* **Weather & Air Quality:** Real-time temperature, humidity, wind direction/speed, UV index, 4-hour forecast, and AQI (with visual inversion for high pollution levels) using the Open-Meteo API.
-* **Strava Integration:** Displays total and yearly activity statistics (distance and ride counts), including specific breakdowns for biking and hiking.
-* **Bambu Lab 3D Printer:** Live monitoring of print status, completion percentage, remaining time, and current layer progress.
-* **Roborock Vacuum:** Live battery level, current status, and tracking for cleaned area during active cleaning.
-* **Spotify:** Displays the currently playing track and artist.
-* **Gmail:** Tracks the number of unread emails in your primary inbox.
-* **System Fallbacks:** Automatically switches to displaying System Load (CPU/RAM usage) or Cryptocurrency prices (BTC/ETH) if certain hardware integrations are disabled or offline for demonstration of dashboard capabilities. The fallback wedgets are not required tokens and ready to go.
-* **Optimized Rendering:** Uses partial screen refreshes to prevent flickering, with scheduled full refreshes to clear e-ink ghosting.
+This is a fork of [czuryk/Waveshare-ePaper-10.85-dashboard](https://github.com/czuryk/Waveshare-ePaper-10.85-dashboard). The upstream project targets a Raspberry Pi Zero with the black/white panel. This fork has diverged a lot:
 
-<img width="2400" height="1792" alt="dashboard_primary" src="https://github.com/user-attachments/assets/20be2eae-4a06-48e2-9ad4-efcba00dcb7f" />
-<img width="2400" height="1792" alt="dashboard_fallback" src="https://github.com/user-attachments/assets/158d65ee-9a12-4f09-a9d3-ea66ca3055bc" />
+| | Upstream | This fork |
+|---|---|---|
+| Board | Raspberry Pi Zero 1W / 2W | **Orange Pi Zero 2W** (Allwinner H618, Armbian) |
+| Panel | 10.85" black/white | **10.85" 4-colour (G)**: black, white, yellow, red |
+| GPIO | gpiozero / lgpio | **libgpiod v2** (`/dev/gpiochip1`) and SPI bus 1 |
+| Refresh | Partial refresh every 60 s | Full refresh every **300 s** (the colour panel has no partial refresh) |
+| Configuration | Edit the top of `main.py` | Separate **`config.py`**, kept out of git |
+| Running | `tmux` | **systemd service**, or a **Debian package** built by CI |
+| Column 1 | Strava, printer, Roborock / AI usage, fallback | **Phrase of the day** or ping, printer, Roborock / AI usage, **Coinbase 24h movers** |
+| Column 3 bottom slot | Gmail | **Fritz!Box DSL line stats** (Gmail still available) |
+
+> The panel code is now Orange Pi-specific. `lib/waveshare_epd/epdconfig.py` hard-codes Orange Pi Zero 2W pin numbers, the GPIO chip and the SPI bus. To run it on a Raspberry Pi, change those values (or use upstream's `epdconfig.py`).
 
 ---
 
-## Prerequisites & Installation
+## Screen layout
 
-### Hardware
-* [Raspberry Pi Zero 1W](https://www.raspberrypi.com/products/raspberry-pi-zero-w/) OR [Raspberry Pi Zero 2W](https://www.raspberrypi.com/products/raspberry-pi-zero-2-w/)
-* [Waveshare E-Ink Display 10.85"](https://www.waveshare.com/10.85inch-e-paper-hat-plus.htm?sku=29790)
+The panel is 1360×480, split into three columns. Only the four colours the panel can show are used. Anything else gets dithered, and dithered text is unreadable.
 
-### 1. System Setup
-Enable the SPI interface on your Raspberry Pi, which is required for communicating with the e-ink display:
-```shell
-sudo raspi-config
+**Column 1: four stacked widgets**
+1. **Phrase of the day**: a daily German phrase with its English translation (`ENABLE_PHRASE`). If Strava is enabled it takes this slot instead. With both disabled, the slot shows **internet quality** (current ping plus a latency history bar chart).
+2. **Bambu Lab printer**: status, progress bar, remaining time and layer count. The progress bar is hidden while the printer is offline, idle or finished.
+3. **Roborock vacuum**: battery, status and cleaned area. The slot falls back to Antigravity usage, then Codex usage, then **system load** (CPU, free RAM and a CPU history chart), depending on what's enabled.
+4. **Coinbase 24h movers**: the top four gainers and losers across Coinbase USD pairs, filtered to pairs with more than $2M of 24h volume so illiquid tokens don't dominate. No API key needed.
+
+**Column 2: weather** (Open-Meteo, no API key)
+- Current conditions as a drawn weather glyph, plus temperature, humidity, pressure, and wind direction and speed.
+- UV index and AQI, highlighted in red at UV ≥ 6 or AQI ≥ 50.
+- A 4-hour forecast.
+
+**Column 3**
+- A large clock and the date.
+- **Claude Code usage** (5-hour and 7-day limits with reset times), or **Spotify** now playing (via Last.fm). With neither enabled, it shows **time progress** bars for the day, month and year.
+- **Fritz!Box DSL**: sync rate, current downstream throughput, ping and line uptime. With `ENABLE_FRITZBOX = False`, this slot shows the **Gmail** unread count instead.
+
+---
+
+## Hardware
+
+* [Orange Pi Zero 2W](http://www.orangepi.org/html/hardWare/computerAndMicrocontrollers/details/Orange-Pi-Zero-2W.html)
+* [Waveshare 10.85" e-Paper HAT+ (G)](https://www.waveshare.com/10.85inch-e-paper-hat-plus-g.htm), the 4-colour version
+
+### Wiring
+
+The HAT plugs into the 40-pin header. These are the pins in use, verified with a multimeter against the Orange Pi Zero 2W pin table:
+
+| Signal | Physical pin | SoC pin | GPIO line (`gpiochip1`) |
+|---|---|---|---|
+| RST | 11 | PH2 | 226 |
+| PWR | 12 | PI1 | 257 |
+| BUSY | 18 | PH4 | 228 |
+| DC | 22 | PI6 | 262 |
+| CS (master) | 24 | PH5 | 229 |
+| CS (slave) | 26 | PH9 | 233 |
+| MOSI / SCLK | 19 / 23 | SPI1 | `/dev/spidev1.0` |
+
+The panel is driven as two 680-px halves, each with its own chip select. Both chip selects are toggled manually as GPIOs, so SPI1 must be enabled **without** its hardware CS (see below).
+
+**BUSY workaround:** on the original unit, the BUSY line doesn't make contact, so the driver waits fixed times instead of reading it (about 25 s per refresh). If your BUSY line works, set `TRUST_BUSY = True` in `lib/waveshare_epd/epd10in85.py` for faster refreshes. `FAST_REFRESH` in the same file picks the fast waveform (less flashing, slightly more ghosting).
+
+---
+
+## Installation
+
+Tested on **Armbian (Debian 13 trixie), kernel 6.18, Python 3.13**.
+
+### 1. Enable SPI1 without chip select
+
+Create an overlay that enables `spidev` on SPI1 without claiming a CS pin:
+
+```dts
+/dts-v1/;
+/plugin/;
+
+/ {
+    compatible = "allwinner,sun50i-h616", "allwinner,sun50i-h618";
+
+    fragment@0 {
+        target = <&spi1>;
+        __overlay__ {
+            status = "okay";
+            #address-cells = <1>;
+            #size-cells = <0>;
+            pinctrl-names = "default";
+            pinctrl-0 = <&spi1_pins>;
+
+            spidev@0 {
+                compatible = "rohm,dh2228fv";
+                status = "okay";
+                reg = <0>;
+                spi-max-frequency = <4000000>;
+            };
+        };
+    };
+};
 ```
-Go to Interfacing Options -> SPI -> Enable.
 
-Update your system and install necessary system-level dependencies, including `tmux` for keeping the script running in the background:
+Save it as `spi1-nocs-spidev.dts`, install it with Armbian's overlay tool, and reboot:
+
+```shell
+sudo armbian-add-overlay spi1-nocs-spidev.dts
+sudo reboot
+```
+
+This adds `user_overlays=spi1-nocs-spidev` to `/boot/armbianEnv.txt`. After the reboot, `/dev/spidev1.0` should exist.
+
+### 2. System packages
+
 ```shell
 sudo apt update
-sudo apt install python3-pip python3-pil python3-numpy git tmux -y
+sudo apt install -y git python3-pip python3-pil python3-numpy python3-requests python3-spidev python3-libgpiod
 ```
 
-### 2. Python Dependencies
-Install the required standard Python packages:
+`python3-libgpiod` must be **v2** (Debian 13 ships 2.2). The driver uses the v2 API (`gpiod.request_lines`).
+
+### 3. Python packages
+
+`main.py` imports the Google API client at startup, so install it even if you don't use Gmail. The rest are only needed for their widgets:
+
 ```shell
-pip3 install requests Pillow google-api-python-client google-auth-httplib2 google-auth-oauthlib aiomqtt roborock paho-mqtt gpiozero lgpio spidev
+pip3 install --break-system-packages google-api-python-client google-auth-httplib2 google-auth-oauthlib
+pip3 install --break-system-packages python-roborock aiomqtt   # Roborock
+pip3 install --break-system-packages paho-mqtt                 # Bambu Lab
 ```
 
-**Notes:**
-The `bambulabs_api` library is already bundled in this package (in lib/), but its dependency paho-mqtt is not — it is included in the command above.
-On Raspberry Pi OS (Bookworm) the GPIO/SPI packages are best installed via apt (a system-managed Python may reject pip for these). If pip3 complains about an "externally-managed-environment", install them with:
+`bambulabs_api` is bundled in `lib/`. The startup message `lgpio pin factory unavailable (No module named 'gpiozero')` is harmless: gpiozero isn't used for the panel on this board.
+
+### 4. Get the code and configure
+
 ```shell
-sudo apt install -y python3-gpiozero python3-lgpio python3-spidev
+git clone https://github.com/fer-marino/Waveshare-ePaper-10.85-dashboard.git ~/dashboard
+cd ~/dashboard
+cp packaging/config.example.py config.py
+nano config.py
 ```
 
-### 3. Display Library
+### 5. First run (interactive logins)
 
-* The **patched** version of the epd10in85 library with fixed partial refresh issue already included in this package.
+Claude, Strava, Roborock and Gmail need a one-time login in the terminal. Run the dashboard once in the foreground, complete the prompts, and stop it with `Ctrl+C`:
 
-* **(New)** Included support of Raspberry PI Zero 1.
+```shell
+sudo python3 main.py
+```
+
+### 6. Run it as a service
+
+```shell
+sudo cp packaging/epaper-dashboard.service /etc/systemd/system/
+```
+
+The shipped unit expects the Debian package layout (`/opt/epaper-dashboard`). For a git checkout, edit `WorkingDirectory` and `ExecStart` in the copy to point at your checkout (for example `/root/dashboard`), and remove the `EPAPER_CONFIG` line. Then enable and start it:
+
+```shell
+sudo systemctl daemon-reload
+sudo systemctl enable --now epaper-dashboard
+journalctl -u epaper-dashboard -f
+```
+
+The unit stops the app with `SIGINT`, so it can power the panel down and release the GPIOs cleanly.
+
+### Alternative: Debian package
+
+Every push builds an `epaper-dashboard_<version>_all.deb` in GitHub Actions. Tagging `v*` attaches it to a release. To build it locally:
+
+```shell
+packaging/build-deb.sh 0.1.0
+sudo apt install ./dist/epaper-dashboard_0.1.0_all.deb
+```
+
+The package installs:
+* the code in `/opt/epaper-dashboard`
+* the config in `/etc/epaper-dashboard/config.py`, registered as a conffile so upgrades keep your edits
+* state (tokens, sessions, the log) in `/var/lib/epaper-dashboard`
+* the service `epaper-dashboard.service`, enabled but not started
+
+The package never contains credentials or local state; CI fails the build if any are found. It doesn't pull in the pip packages from step 3, so install those separately.
 
 ---
 
-## Configuration & Widget Setup
+## Configuration
 
-All widget toggles and API configurations are located at the top of the `main.py` script. You can enable or disable specific widgets using the `ENABLE_*` boolean variables.
+Settings are read from the first of these files that exists:
 
-### Codex (ChatGPT)
-1. Codex limits are read from the official OpenAI Codex CLI tokens — unlike Claude, the dashboard does not run its own browser login flow.
-2. Install the Codex CLI (for example `npm install -g @openai/codex`) and run codex login in the terminal.
-3. A browser window opens — sign in with your ChatGPT account and click "Authorize". (Codex usage limits require a paid ChatGPT plan that includes Codex.)
-4. After a successful login the CLI writes your tokens to `~/.codex/auth.json` (on Windows: `%USERPROFILE%\.codex\auth.json`).
-5. Copy that file into the project root, next to `codex.py`, keeping the exact name `auth.json`.
-6. Set `ENABLE_CODEX = True` in `main.py` and run the script. The dashboard reads `auth.json`, fetches your usage, and from then on refreshes and rotates the tokens automatically, updating auth.json in place.
+1. the path in `$EPAPER_CONFIG`
+2. `/etc/epaper-dashboard/config.py`
+3. `config.py` next to `main.py`
 
-### Claude Code
-1. Run the `main.py` script from the terminal for the first time.
-2. The script will pause, ask for your to copy the authorization URL and paste it on real browser.
-3. Open that URL in your browser, click "Authorize", and you will be redirected to a dead `localhost` page.
-7. Copy the whole URL containing `code=...` portion from your browser's address bar and paste it back into the terminal. The script will automatically fetch and save the required tokens to `claude_creds.json`.
+Anything you leave out falls back to the default in `main.py`. `config.py` is in `.gitignore` because it holds credentials. Start from `packaging/config.example.py`.
 
-### Strava
-1. Go to your Strava API Settings and create an API Application. **Now only payed accounts supported**
-2. Note down your **Client ID** and **Client Secret**.
-3. Run the `main.py` script from the terminal for the first time.
-4. The script will pause, ask for your ID/Secret, and print an authorization URL in the console. 
-5. Open that URL in your browser, click "Authorize", and you will be redirected to a dead `localhost` page.
-6. Copy the `code=...` portion from your browser's address bar and paste it back into the terminal. The script will automatically fetch and save the required `activity:read_all` tokens to `strava_token.json`.
+| Setting | Default | Purpose |
+|---|---|---|
+| `ENABLE_PHRASE` | `True` | Phrase of the day, top-left slot |
+| `ENABLE_STRAVA` | `False` | Strava stats, replaces the phrase (paid Strava tier only) |
+| `ENABLE_BAMBU` | `False` | Bambu Lab printer |
+| `ENABLE_ROBOROCK` | `False` | Roborock vacuum |
+| `ENABLE_ANTIGRAVITY` / `ENABLE_CODEX` | `False` | AI usage, used when Roborock is off |
+| `ENABLE_CLAUDE` | `False` | Claude Code usage |
+| `ENABLE_SPOTIFY` | `False` | Now playing via Last.fm, used when Claude is off |
+| `ENABLE_FRITZBOX` | `True` | Fritz!Box DSL stats instead of Gmail |
+| `LOCATION_LAT` / `LOCATION_LON` | Frankfurt | Location for weather, AQI and UV |
+| `REFRESH_INTERVAL_SEC` | `300` | Seconds between frames |
+| `STATE_DIR` | next to `main.py` | Where tokens, sessions and the log are written |
+| `PRINTER_CONF` | empty | `IP`, `SERIAL`, `ACCESS_CODE` |
+| `ROBOROCK_CONF` | empty | `EMAIL` |
+| `FRITZBOX_CONF` | `fritz.box` | `HOST` |
+| `LASTFM_CONF` | empty | `API_KEY`, `USERNAME` |
 
-### Roborock
-1. Open `main.py` and input your Roborock account email address in the `ROBOROCK_CONF` dictionary.
-2. Run the script from the terminal.
-3. The script will request an OTP (One-Time Password) which will be sent to your email.
-4. Enter the 6-digit code in the terminal. The script will securely save your session data locally.
+**Refresh interval:** each refresh on the 4-colour panel is a full-screen flash lasting about 12 s (fast waveform) to 18 s (full waveform). Waveshare warns that refreshing large panels too often causes ghosting and can damage them, so don't go much below 300 s.
 
-### Bambu Lab 3D Printer
-**You DON'T need to enable "LAN Mode" on your Bambu Lab printer to access local data.**
-1. On your printer's screen, go to **Settings -> Network**.
-2. Note your printer's **IP Address**, **Serial Number**, and **Access Code**. (Force on your router to map exact IP address)
-3. Update the `PRINTER_CONF` dictionary in the script with these local credentials.
+### Widget setup
 
-### Spotify (via Last.fm)
-Since the official Spotify API requires running a local web server for complex token renewals, this dashboard uses Last.fm to fetch the current playing track reliably form Spotify. It's is transparent and working method.
-1. Connect your Spotify account to Last.fm.
-2. Create a Last.fm API account to generate an **API Key**.
-3. Update `LASTFM_CONF` in the script with your API Key and Last.fm Username.
-   
-**After configuration, you no longer need to use the Last.fm service, and a paid Last.fm account is not required. You can continue to use only the Spotify service.**
+#### Fritz!Box
+No credentials needed. The DSL sync rate and throughput come from the router's TR-064/IGD endpoints, which don't require a login. Make sure *Transmit status information over UPnP* is enabled on the Fritz!Box (Home Network → Network → Network Settings). Set `FRITZBOX_CONF['HOST']` if the router isn't reachable as `fritz.box`.
 
-### Gmail
-1. Go to the Google Cloud Console.
-2. Create a new project and enable the **Gmail API**.
-3. Create OAuth 2.0 Client ID credentials (choose "Desktop Application" as the application type).
-4. Download the generated JSON file, rename it exactly to `credentials.json` (if your setup requires it, or just use `token.json` generation), and place it in the same directory as the script.
-5. On the first run, the script will open a browser window (or provide a link) for you to log in and grant read-only access. It will generate a `token.json` file for all future headless authentications.
+#### Bambu Lab 3D printer
+You don't need LAN-only mode. On the printer, open **Settings → Network**, note the **IP address**, **serial number** and **access code**, and put them in `PRINTER_CONF`. Give the printer a fixed IP in your router.
+
+#### Roborock
+Put your account email in `ROBOROCK_CONF`. On the first run the app asks for the one-time code that Roborock emails you, then saves the session to `roborock_session.pkl` in `STATE_DIR`.
+
+#### Claude Code
+On the first run, the app prints an authorization URL. Open it in a browser and click **Authorize**. You'll land on a dead `localhost` page: copy the whole URL (the one containing `code=...`) back into the terminal. Tokens are saved to `claude_creds.json` next to `main.py`, and usage is refreshed every 10 minutes into `usage.json`.
+
+#### Codex
+The dashboard reuses the official Codex CLI's tokens. Run `codex login` on any machine, copy `~/.codex/auth.json` next to `codex.py`, and set `ENABLE_CODEX = True`. The app refreshes and rotates the tokens in that file automatically. You need a paid ChatGPT plan that includes Codex.
+
+#### Strava
+Paid Strava accounts only. Create an API application in your Strava settings. On the first run, enter the client ID and secret, open the printed URL, authorize, and paste the `code=...` from the dead `localhost` page back into the terminal. The token is saved to `strava_token.json`.
+
+#### Spotify (via Last.fm)
+Connect Spotify to Last.fm, create a Last.fm API key, and fill in `LASTFM_CONF`. A free Last.fm account is enough.
+
+#### Gmail
+Only used when `ENABLE_FRITZBOX = False`. Create a Google Cloud project, enable the Gmail API, create an OAuth client ID of type *Desktop app*, and save it as `credentials.json` next to `main.py`. The first run asks you to grant read-only access and saves `token.json`.
 
 ---
 
-## Running the Dashboard
+## How it works
 
-To ensure the dashboard continues running even after you close your SSH connection, use `tmux`.
+* **Background fetching:** data is fetched in background threads, each service on its own interval (Fritz!Box every 60 s, Claude and Codex every 10 min, the printer every 5–15 s, and so on). A slow or unreachable service never blocks the others.
+* **Rendering:** the main loop renders from a thread-safe data store every `REFRESH_INTERVAL_SEC`. At startup it waits up to 45 s for the first weather data, so the first frame isn't blank.
+* **Watchdogs:** panel operations run under a `SIGALRM` watchdog. If the panel is unplugged or stuck at startup, the process exits with an error and systemd restarts it after 30 s, instead of the display silently freezing.
+* **Errors:** an error while drawing a frame is logged with its full traceback to the journal and to `dashboard.log` (rotated at 1 MB), and the loop tries again on the next cycle.
 
-1. Start a new tmux session:
+---
+
+## Troubleshooting
+
 ```shell
-tmux new -s dashboard
+systemctl status epaper-dashboard
+journalctl -u epaper-dashboard -n 100
+tail -f ~/dashboard/dashboard.log     # or /var/lib/epaper-dashboard/dashboard.log for the .deb
 ```
 
-2. Run the script inside the tmux session:
-```shell
-python3 main.py
-```
+* **`e-Paper busy H` / `busy release` lines:** normal. They mark each panel refresh.
+* **The same error every refresh, and the screen doesn't change:** a widget is failing while drawing. The traceback in the log names the line.
+* **`/dev/spidev1.0` missing:** the SPI overlay isn't loaded. Check `user_overlays` in `/boot/armbianEnv.txt`.
+* **Garbled or half-drawn frames:** the panel is being written while it's still busy. Increase `REFRESH_SETTLE_SEC` in `lib/waveshare_epd/epd10in85.py`, or fix the BUSY line and set `TRUST_BUSY = True`.
 
-3. Detach from the session (leave it running in the background) by pressing:
-`Ctrl+B`, then release and press `D`.
+---
 
-To reattach to the session later and view the logs or stop the script:
-```shell
-tmux attach -t dashboard
-```
+## Credits
 
-## How It Works
-
-The dashboard is built on a robust, multi-threaded architecture designed to keep the UI responsive and prevent hardware lockups.
-
-* **Asynchronous Data Fetching:** Instead of fetching all data sequentially, the script spawns dedicated background threads. Each service (Weather, Strava, Roborock, Bambu Lab, etc.) pulls data asynchronously at its own specific interval. This ensures that a slow API response or a temporary network drop from one service will never block the others or freeze the system.
-* **Scheduled Rendering:** The main application loop acts purely as a renderer. It collects the latest available information from a thread-safe global data store and pushes a new frame to the e-ink display exactly once per minute using a partial screen refresh. 
-
-**Important Notes:**
-
-* **Initial Data Population Delay:** When you first launch the script, you will notice that the widgets may show placeholders or zeros, and the full array of data takes a few minutes to completely appear on the screen. This is an intentional design choice to stagger initial network requests. It prevents sudden spikes in CPU usage, avoids overwhelming the Raspberry Pi's network stack, and respects the rate limits of the external APIs.
-* **Hardware Refresh Limits:** The 60-second rendering interval is strictly enforced. Refreshing the screen more frequently than once a minute is strongly discouraged by the display manufacturer (Waveshare). Aggressive refresh rates on large e-paper panels can lead to severe ghosting and may cause permanent hardware damage to the display.
-
-## The 3d printed case
-
-You can download the case stl files [here](https://makerworld.com/en/models/2322517-epaper-dashboard-waveshare-10-85).
-
-## Video assembly guide
-
-**(Youtube clickable)**
-
-[![Video Title](https://img.youtube.com/vi/H964RpaJvu0/0.jpg)](https://youtu.be/H964RpaJvu0)
+Based on [czuryk/Waveshare-ePaper-10.85-dashboard](https://github.com/czuryk/Waveshare-ePaper-10.85-dashboard). Upstream also has a [3D-printed case](https://makerworld.com/en/models/2322517-epaper-dashboard-waveshare-10-85) and an [assembly video](https://youtu.be/H964RpaJvu0), both designed around the Raspberry Pi Zero.
