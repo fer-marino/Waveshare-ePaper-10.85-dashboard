@@ -26,9 +26,15 @@ from PIL import Image, ImageDraw, ImageFont, ImageOps, ImageEnhance
 from logging.handlers import RotatingFileHandler
 
 # --- GMAIL IMPORTS ---
-from googleapiclient.discovery import build
-from google.oauth2.credentials import Credentials
-from google.auth.transport.requests import Request
+# Optional: only the Gmail widget needs the Google client, and it is not in
+# the Debian package dependencies, so a missing install must not stop startup.
+try:
+    from googleapiclient.discovery import build
+    from google.oauth2.credentials import Credentials
+    from google.auth.transport.requests import Request
+    GMAIL_AVAILABLE = True
+except ImportError:
+    GMAIL_AVAILABLE = False
 
 # --- SYSTEM LIMITS ---
 try:
@@ -963,7 +969,8 @@ def update_data_thread():
                     data_store.ping['history'].append(int(ms))
                 data_store.last_update['ping'] = now
 
-        if now - data_store.last_update['gmail'] > 300:
+        # The Gmail slot is only drawn when the Fritz!Box widget is off.
+        if GMAIL_AVAILABLE and not ENABLE_FRITZBOX and now - data_store.last_update['gmail'] > 300:
             try:
                 creds = None
                 if os.path.exists(GMAIL_TOKEN_PATH):

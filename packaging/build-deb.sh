@@ -48,13 +48,15 @@ Priority: optional
 Architecture: all
 Depends: python3 (>= 3.9), python3-pil, python3-numpy, python3-requests, python3-spidev, python3-libgpiod
 Recommends: python3-pip
+Suggests: python3-googleapi, python3-google-auth-oauthlib
 Maintainer: epaper-dashboard contributors <noreply@example.com>
 Installed-Size: $INSTALLED_KB
 Description: E-ink dashboard for Waveshare 10.85" e-Paper panels
  Renders weather, air quality, device status and service usage to a
  Waveshare 10.85" e-Paper HAT+, including the 4-colour (G) variant.
- Runs as a systemd service and supports Raspberry Pi and Orange Pi
- boards via a libgpiod backend.
+ Runs as a systemd service. The panel driver targets the Orange Pi
+ Zero 2W (libgpiod v2, gpiochip1, SPI bus 1); other boards need their
+ pins set in lib/waveshare_epd/epdconfig.py.
 EOF
 
 # config.py is a conffile so dpkg leaves local edits alone across upgrades

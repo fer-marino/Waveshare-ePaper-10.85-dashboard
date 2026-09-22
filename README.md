@@ -121,12 +121,12 @@ sudo apt install -y git python3-pip python3-pil python3-numpy python3-requests p
 
 ### 3. Python packages
 
-`main.py` imports the Google API client at startup, so install it even if you don't use Gmail. The rest are only needed for their widgets:
+Each of these is only needed for its widget:
 
 ```shell
-pip3 install --break-system-packages google-api-python-client google-auth-httplib2 google-auth-oauthlib
 pip3 install --break-system-packages python-roborock aiomqtt   # Roborock
 pip3 install --break-system-packages paho-mqtt                 # Bambu Lab
+pip3 install --break-system-packages google-api-python-client google-auth-httplib2 google-auth-oauthlib   # Gmail
 ```
 
 `bambulabs_api` is bundled in `lib/`. The startup message `lgpio pin factory unavailable (No module named 'gpiozero')` is harmless: gpiozero isn't used for the panel on this board.
@@ -179,7 +179,7 @@ The package installs:
 * state (tokens, sessions, the log) in `/var/lib/epaper-dashboard`
 * the service `epaper-dashboard.service`, enabled but not started
 
-The package never contains credentials or local state; CI fails the build if any are found. It doesn't pull in the pip packages from step 3, so install those separately.
+The package never contains credentials or local state; CI fails the build if any are found. It doesn't pull in the pip packages from step 3, so install the ones for your widgets separately.
 
 ---
 
