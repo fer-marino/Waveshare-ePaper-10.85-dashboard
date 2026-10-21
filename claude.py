@@ -38,6 +38,10 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
+# Set when the token endpoint says the refresh token itself is dead. That is not
+# a transient failure: nothing but a fresh browser login recovers from it.
+_login_expired = False
+
 
 def generate_pkce():
     verifier = secrets.token_urlsafe(64)[:128]
@@ -70,9 +74,13 @@ def token_is_expired(creds: dict) -> bool:
     return now_ms >= (expires_at - REFRESH_BUFFER_SEC * 1000)
 
 
-def interactive_auth() -> bool:
-    """Interactive authorization flow for the main script setup."""
-    if load_credentials():
+def interactive_auth(force: bool = False) -> bool:
+    """Interactive authorization flow for the main script setup.
+
+    Skipped when credentials already exist, unless force is set (used by --reauth
+    once the stored login has expired and the old file is useless).
+    """
+    if not force and load_credentials():
         return True
 
     verifier, challenge = generate_pkce()
@@ -166,6 +174,9 @@ def refresh_access_token(creds: dict) -> dict | None:
         resp = requests.post(TOKEN_URL, json=payload, timeout=15)
         if resp.status_code != 200:
             log.error(f"Token refresh failed: {resp.status_code} {resp.text}")
+            global _login_expired
+            if resp.status_code == 400 and "invalid_grant" in resp.text:
+                _login_expired = True
             return None
         data = resp.json()
         creds["accessToken"] = data.get("access_token")
@@ -230,7 +241,8 @@ def main():
     if token_is_expired(creds):
         creds = refresh_access_token(creds)
         if not creds:
-            USAGE_FILE.write_text(json.dumps({"error": "token_refresh_failed"}, indent=2))
+            err = "reauth_required" if _login_expired else "token_refresh_failed"
+            USAGE_FILE.write_text(json.dumps({"error": err}, indent=2))
             sys.exit(1)
 
     raw = fetch_usage(creds.get("accessToken"))
@@ -242,8 +254,16 @@ def main():
     if raw:
         save_usage(raw)
     else:
-        USAGE_FILE.write_text(json.dumps({"error": "fetch_failed"}, indent=2))
+        err = "reauth_required" if _login_expired else "fetch_failed"
+        USAGE_FILE.write_text(json.dumps({"error": err}, indent=2))
 
 
 if __name__ == "__main__":
-    main()
+    if "--reauth" in sys.argv[1:]:
+        # Renew an expired login: python3 claude.py --reauth
+        if interactive_auth(force=True):
+            main()
+        else:
+            sys.exit(1)
+    else:
+        main()

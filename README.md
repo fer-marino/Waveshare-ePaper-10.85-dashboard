@@ -227,6 +227,13 @@ Put your account email in `ROBOROCK_CONF`. On the first run the app asks for the
 #### Claude Code
 On the first run, the app prints an authorization URL. Open it in a browser and click **Authorize**. You'll land on a dead `localhost` page: copy the whole URL (the one containing `code=...`) back into the terminal. Tokens are saved to `claude_creds.json` next to `main.py`, and usage is refreshed every 10 minutes into `usage.json`.
 
+The login itself expires after a while, and the stored refresh token can't renew it (in one setup this happened about a month after the first login). The widget then shows **"Claude login expired"**. Renew it by running the login again; nothing else needs to change:
+
+```shell
+cd ~/dashboard            # or /opt/epaper-dashboard
+sudo python3 claude.py --reauth
+```
+
 #### Codex
 The dashboard reuses the official Codex CLI's tokens. Run `codex login` on any machine, copy `~/.codex/auth.json` next to `codex.py`, and set `ENABLE_CODEX = True`. The app refreshes and rotates the tokens in that file automatically. You need a paid ChatGPT plan that includes Codex.
 
@@ -260,6 +267,7 @@ tail -f ~/dashboard/dashboard.log     # or /var/lib/epaper-dashboard/dashboard.l
 
 * **`e-Paper busy H` / `busy release` lines:** normal. They mark each panel refresh.
 * **The same error every refresh, and the screen doesn't change:** a widget is failing while drawing. The traceback in the log names the line.
+* **"Claude login expired" on the screen:** run `sudo python3 claude.py --reauth` (see the Claude Code section above).
 * **`/dev/spidev1.0` missing:** the SPI overlay isn't loaded. Check `user_overlays` in `/boot/armbianEnv.txt`.
 * **Garbled or half-drawn frames:** the panel is being written while it's still busy. Increase `REFRESH_SETTLE_SEC` in `lib/waveshare_epd/epd10in85.py`, or fix the BUSY line and set `TRUST_BUSY = True`.
 

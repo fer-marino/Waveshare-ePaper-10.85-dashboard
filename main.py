@@ -997,6 +997,7 @@ def update_data_thread():
                     with data_store.lock:
                         data_store.claude = usage_data
                         if "error" in usage_data and "five_hour" not in usage_data:
+                            data_store.claude['reason'] = usage_data.get('error')
                             data_store.claude['error'] = True
                         else:
                             data_store.claude['error'] = False
@@ -1593,7 +1594,11 @@ def render_screen(epd, fonts):
         draw_icon(draw, col3_x, sp_y - 2, "icon_claude", (34, 34), color=RED)
         draw.text((col3_x + 44, sp_y), "CLAUDE AI USAGE", font=fonts['28'], fill=BLACK)
 
-        if claude.get('error'):
+        if claude.get('error') and claude.get('reason') == 'reauth_required':
+            # The OAuth login itself has expired; only a new browser login fixes it.
+            draw.text((col3_x, sp_y + 44), "Claude login expired", font=fonts['24'], fill=RED)
+            draw.text((col3_x, sp_y + 76), "Run: python3 claude.py --reauth", font=fonts['20'], fill=BLACK)
+        elif claude.get('error'):
             draw.text((col3_x, sp_y + 50), "Claude Usage Error", font=fonts['24'], fill=BLACK)
         else:
             # 5-Hour Limit
