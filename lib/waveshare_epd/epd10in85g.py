@@ -81,10 +81,12 @@ class EPD():
 
     def ReadBusyH(self):
         print("e-Paper busy H")
+        t0 = time.monotonic()
         epdconfig.delay_ms(100)
         while(epdconfig.digital_read(self.EPD_BUSY_PIN) == 0):      # 0: idle, 1: busy
             epdconfig.delay_ms(20)
-        print("e-Paper busy release")
+        self.last_busy_duration = time.monotonic() - t0
+        print(f"e-Paper busy release ({self.last_busy_duration:.2f}s)")
 
     def TurnOnDisplay(self):
         self.CS_ALL(0)

@@ -6,16 +6,16 @@ This is a fork of [czuryk/Waveshare-ePaper-10.85-dashboard](https://github.com/c
 
 | | Upstream | This fork |
 |---|---|---|
-| Board | Raspberry Pi Zero 1W / 2W | **Orange Pi Zero 2W** (Allwinner H618, Armbian) |
+| Board | Raspberry Pi Zero 1W / 2W | **Raspberry Pi Zero 1W / 2W** & **Orange Pi Zero 2W** (auto-detected) |
 | Panel | 10.85" black/white | **10.85" 4-colour (G)**: black, white, yellow, red |
-| GPIO | gpiozero / lgpio | **libgpiod v2** (`/dev/gpiochip1`) and SPI bus 1 |
+| GPIO | gpiozero / lgpio | **libgpiod v2** (with `gpiozero` fallback) and hardware SPI |
 | Refresh | Partial refresh every 60 s | Full refresh every **300 s** (the colour panel has no partial refresh) |
 | Configuration | Edit the top of `main.py` | Separate **`config.py`**, kept out of git |
 | Running | `tmux` | **systemd service**, or a **Debian package** built by CI |
 | Column 1 | Strava, printer, Roborock / AI usage, fallback | **Phrase of the day** or ping, printer, Roborock / AI usage, **Coinbase 24h movers** |
 | Column 3 bottom slot | Gmail | **Fritz!Box DSL line stats** (Gmail still available) |
 
-> The panel code is now Orange Pi-specific. `lib/waveshare_epd/epdconfig.py` hard-codes Orange Pi Zero 2W pin numbers, the GPIO chip and the SPI bus. To run it on a Raspberry Pi, change those values (or use upstream's `epdconfig.py`).
+> `lib/waveshare_epd/epdconfig.py` automatically detects whether it is running on a **Raspberry Pi** (`gpiochip0`, SPI0, BCM pins) or an **Orange Pi Zero 2W** (`gpiochip1`, SPI1, Allwinner H618 pins).
 
 ---
 

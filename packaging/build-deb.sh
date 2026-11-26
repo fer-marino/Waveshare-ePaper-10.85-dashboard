@@ -54,9 +54,8 @@ Installed-Size: $INSTALLED_KB
 Description: E-ink dashboard for Waveshare 10.85" e-Paper panels
  Renders weather, air quality, device status and service usage to a
  Waveshare 10.85" e-Paper HAT+, including the 4-colour (G) variant.
- Runs as a systemd service. The panel driver targets the Orange Pi
- Zero 2W (libgpiod v2, gpiochip1, SPI bus 1); other boards need their
- pins set in lib/waveshare_epd/epdconfig.py.
+ Runs as a systemd service. Auto-detects Raspberry Pi (SPI0, gpiochip0)
+ and Orange Pi Zero 2W (SPI1, gpiochip1) in lib/waveshare_epd/epdconfig.py.
 EOF
 
 # config.py is a conffile so dpkg leaves local edits alone across upgrades
